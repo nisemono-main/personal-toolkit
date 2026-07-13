@@ -436,7 +436,6 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 mute_event=mute_event,
                 output_channels=output_channels,
                 buffer_capacity_samples=max_buffer_blocks * block_size,
-                target_buffer_samples=prefill_blocks * block_size,
             )
 
             phase = "hotkey registration"
