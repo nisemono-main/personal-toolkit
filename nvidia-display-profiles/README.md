@@ -8,7 +8,7 @@ Switching between a desktop setup and game-specific display settings involved se
 
 ## Setup
 
-1. Copy `config.example.ini` to `config.ini`.
+1. Create `config.ini` beside `Set-DisplayProfile.ps1`, using `config.example.ini` as the layout reference.
 2. Set the display profile values, optional monitor device instance ID, game launch commands, and process names in `config.ini`.
 3. Run `Run-GameProfile.vbs` or `Run-DefaultProfileHidden.vbs` as appropriate.
 

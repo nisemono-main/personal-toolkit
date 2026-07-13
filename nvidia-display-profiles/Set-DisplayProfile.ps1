@@ -93,7 +93,7 @@ function ConvertTo-IniBool {
 
 $configPath = Join-Path $PSScriptRoot 'config.ini'
 if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-    throw "Missing local configuration: $configPath. Copy config.example.ini to config.ini and set the values for this computer."
+    throw "Missing local configuration: $configPath. Create config.ini using config.example.ini as the layout reference, then set the values for this computer."
 }
 
 $config = Import-IniFile -Path $configPath

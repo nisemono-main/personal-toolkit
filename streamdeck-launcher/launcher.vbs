@@ -87,7 +87,7 @@ End Function
 Function LoadConfig(configPath)
     Dim result, file, line, separator, key, value
     If Not fso.FileExists(configPath) Then
-        Fail 1, "Missing local configuration: " & configPath & ". Copy launcher.example.ini to launcher.ini and set the values for this computer."
+        Fail 1, "Missing local configuration: " & configPath & ". Create launcher.ini using launcher.example.ini as the layout reference, then set the values for this computer."
     End If
 
     Set result = CreateObject("Scripting.Dictionary")

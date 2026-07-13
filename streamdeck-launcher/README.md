@@ -4,11 +4,11 @@ A small VBScript launcher for starting applications, Steam URIs, folders, and co
 
 ## Setup
 
-1. Copy `launcher.example.ini` to `launcher.ini`.
+1. Create `launcher.ini` beside `launcher.vbs`, using `launcher.example.ini` as the layout reference.
 2. Set executable paths and optional relative companion-script paths in `launcher.ini`.
 3. Bind commands such as `wscript.exe launcher.vbs steam` or `wscript.exe launcher.vbs explorer "C:\Some\Folder"` to shortcuts or buttons.
 
-`launcher.vbs` loads only `launcher.ini` beside itself. The example is a tracked template; copy it to that exact sibling filename so the launcher uses your settings. A typical layout is:
+`launcher.vbs` loads only `launcher.ini` beside itself. The example is a tracked layout reference; create that exact sibling filename so the launcher uses your settings. A typical layout is:
 
 ```ini
 steam_exe=%ProgramFiles(x86)%\Steam\steam.exe
