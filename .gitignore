@@ -1,0 +1,19 @@
+# Local machine configuration
+**/config.ini
+**/launcher.ini
+
+# Python/runtime artifacts
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/venv/
+
+# Generated WizTree input/output
+**/*.csv
+**/output_hierarchy*.md
+
+# Editor and operating-system noise
+.DS_Store
+Thumbs.db
+*.user
+*.suo
