@@ -7,12 +7,13 @@ import logging
 import math
 import signal
 import threading
+import time
 from typing import Callable
 
 import sounddevice as sd
 from ctypes import wintypes
 
-from .audio_engine import AudioEngine, LookaheadLimiter
+from .audio_engine import AudioEngine, AudioHealthSnapshot, LookaheadLimiter
 from .config import MAX_THRESHOLD_DB, MIN_THRESHOLD_DB, LoudGateConfig, save_config
 from .devices import (
     hostapi_name,
@@ -25,6 +26,11 @@ from .devices import (
 
 DEFAULT_BLOCK_MS = 10.0
 DEFAULT_STREAM_LATENCY_MS = 100.0
+STARTUP_RETRY_LIMIT = 3
+RETRY_DELAY_SECONDS = 5.0
+HEALTH_POLL_SECONDS = 0.25
+HEALTH_LOG_INTERVAL_SECONDS = 5.0
+HEALTH_RESTART_STREAK = 3
 
 HOTKEY_ID = 1
 HOTKEY_ID_STOP = 2
@@ -168,27 +174,37 @@ class GlobalHotkeyManager:
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
         self._ready = threading.Event()
+        self._stop_requested = threading.Event()
         self._error: BaseException | None = None
         self._registered_hotkeys: list[int] = []
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="ConfiguredHotkeys", daemon=True)
         self._thread.start()
-        self._ready.wait()
+        if not self._ready.wait(timeout=5.0):
+            raise RuntimeError("The global hotkey thread did not finish initializing within five seconds.")
         if self._error is not None:
             raise self._error
 
     def stop(self) -> None:
-        if self._thread_id is not None:
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_requested.set()
+        if self._thread_id is not None and thread.is_alive():
             user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        thread.join(timeout=2.0)
+        if thread.is_alive():
+            self.logger.warning("The global hotkey thread did not stop within two seconds.")
 
     def _run(self) -> None:
         try:
             self._thread_id = kernel32.GetCurrentThreadId()
             msg = MSG()
             user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+
+            if self._stop_requested.is_set():
+                return
 
             for hotkey_id, (modifiers, virtual_key, label) in self.hotkeys.items():
                 if not user32.RegisterHotKey(None, hotkey_id, modifiers, virtual_key):
@@ -200,6 +216,8 @@ class GlobalHotkeyManager:
                 self._registered_hotkeys.append(hotkey_id)
 
             self._ready.set()
+            if self._stop_requested.is_set():
+                return
             self.logger.info(
                 "Hotkeys registered: mute=%s, stop=%s, threshold down=%s, threshold up=%s, step=%.1f dB.",
                 self.hotkeys[HOTKEY_ID][2],
@@ -253,9 +271,18 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
 
     install_shutdown_handlers(stop_event)
 
+    startup_attempts = 0
+    has_started_once = False
+
     while not stop_event.is_set():
+        hotkey: GlobalHotkeyManager | None = None
+        startup_complete = False
+        phase = "initialization"
         try:
+            startup_attempts += 1
+            phase = "device discovery"
             devices = list_devices()
+            phase = "device resolution"
             in_idx = resolve_device_index(devices, cfg, "input", want_input=True)
             out_idx = resolve_device_index(devices, cfg, "output", want_input=False)
 
@@ -291,6 +318,7 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     devices[out_idx]["name"],
                 )
 
+            phase = "stream configuration"
             input_channels = max(1, min(2, int(devices[in_idx]["max_input_channels"])))
             output_channels = max(1, min(2, int(devices[out_idx]["max_output_channels"])))
             sample_rate = resolve_sample_rate(devices, in_idx, out_idx, input_channels, output_channels)
@@ -323,6 +351,7 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 direction = "lowered" if delta_db < 0 else "raised"
                 logger.info("Threshold %s by %.1f dB -> %.1f dBFS", direction, step, new_threshold)
 
+            phase = "buffer and hotkey setup"
             hotkey = GlobalHotkeyManager(
                 mute_event,
                 stop_event,
@@ -349,6 +378,7 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 buffer_capacity_samples=max_buffer_blocks * block_size,
             )
 
+            phase = "hotkey registration"
             hotkey.start()
             if stop_event.is_set():
                 break
@@ -373,6 +403,7 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     flush=True,
                 )
 
+            phase = "input stream startup"
             with sd.InputStream(
                 samplerate=sample_rate,
                 blocksize=block_size,
@@ -389,6 +420,10 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     if stop_event.wait(0.05):
                         break
 
+                if stop_event.is_set():
+                    break
+
+                phase = "output stream startup"
                 with sd.OutputStream(
                     samplerate=sample_rate,
                     blocksize=block_size,
@@ -398,8 +433,69 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     callback=audio.output_callback,
                     latency=output_latency,
                 ):
-                    while not stop_event.wait(0.25):
-                        pass
+                    startup_complete = True
+                    has_started_once = True
+                    startup_attempts = 0
+                    logger.info(
+                        "Audio streams ready; queue target=%s samples, capacity=%s samples.",
+                        prefill_blocks * block_size,
+                        audio.buffer.capacity_samples,
+                    )
+
+                    target_queue_samples = prefill_blocks * block_size
+                    high_water_samples = min(
+                        audio.buffer.capacity_samples,
+                        target_queue_samples + (2 * block_size),
+                    )
+                    low_water_samples = max(0, target_queue_samples - (2 * block_size))
+                    callback_fault_streak = 0
+                    low_queue_streak = 0
+                    last_health_log = 0.0
+
+                    while not stop_event.wait(HEALTH_POLL_SECONDS):
+                        phase = "audio health monitoring"
+                        audio.rebalance_buffer(
+                            high_water_samples=high_water_samples,
+                            max_drop_samples=block_size,
+                        )
+                        snapshot = audio.health.consume()
+                        queue_samples = audio.buffer.available_samples
+                        queue_ratio = queue_samples / float(audio.buffer.capacity_samples)
+                        queue_is_low = (
+                            not mute_event.is_set()
+                            and queue_samples < low_water_samples
+                        )
+                        low_queue_streak = low_queue_streak + 1 if queue_is_low else 0
+
+                        if snapshot.has_callback_status or snapshot.buffer_underflow_samples:
+                            callback_fault_streak += 1
+                        else:
+                            callback_fault_streak = 0
+
+                        if snapshot.has_events or queue_is_low:
+                            now = time.monotonic()
+                            if now - last_health_log >= HEALTH_LOG_INTERVAL_SECONDS:
+                                logger.warning(
+                                    "Audio health: %s; queue=%s/%s samples (%.1f%%).",
+                                    _describe_audio_health(snapshot, queue_is_low),
+                                    queue_samples,
+                                    audio.buffer.capacity_samples,
+                                    queue_ratio * 100.0,
+                                )
+                                last_health_log = now
+
+                        if callback_fault_streak >= HEALTH_RESTART_STREAK:
+                            raise RuntimeError(
+                                "Audio callbacks reported stream faults for "
+                                f"{callback_fault_streak} consecutive health checks: "
+                                f"{_describe_audio_health(snapshot, queue_is_low)}"
+                            )
+
+                        if low_queue_streak >= HEALTH_RESTART_STREAK:
+                            raise RuntimeError(
+                                "Audio output queue remained below its low-water mark for "
+                                f"{low_queue_streak} consecutive health checks."
+                            )
 
         except KeyboardInterrupt:
             stop_event.set()
@@ -408,11 +504,52 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
         except Exception as exc:
             if stop_event.is_set():
                 break
-            logger.exception("Runtime error: %s", exc)
+
+            if startup_complete or has_started_once:
+                logger.exception("Runtime failure during %s: %s", phase, exc)
+            else:
+                logger.exception(
+                    "Startup attempt %s/%s failed during %s: %s",
+                    startup_attempts,
+                    STARTUP_RETRY_LIMIT,
+                    phase,
+                    exc,
+                )
+                if startup_attempts >= STARTUP_RETRY_LIMIT:
+                    raise RuntimeError(
+                        "Audio service could not start after "
+                        f"{STARTUP_RETRY_LIMIT} attempts. Last failure during {phase}: {exc}"
+                    ) from exc
+
             if verbose:
-                print(f"Audio engine error: {exc}", flush=True)
-            if stop_event.wait(5.0):
+                print(f"Audio engine error during {phase}: {exc}", flush=True)
+            if stop_event.wait(RETRY_DELAY_SECONDS):
                 break
             continue
         finally:
-            hotkey.stop()
+            if hotkey is not None:
+                try:
+                    hotkey.stop()
+                except Exception:
+                    logger.exception("Failed to cleanly stop the global hotkey manager.")
+
+
+def _describe_audio_health(snapshot: AudioHealthSnapshot, queue_is_low: bool) -> str:
+    details: list[str] = []
+    if snapshot.input_overflows:
+        details.append(f"input overflows={snapshot.input_overflows}")
+    if snapshot.input_underflows:
+        details.append(f"input underflows={snapshot.input_underflows}")
+    if snapshot.output_overflows:
+        details.append(f"output overflows={snapshot.output_overflows}")
+    if snapshot.output_underflows:
+        details.append(f"output underflows={snapshot.output_underflows}")
+    if snapshot.buffer_underflow_samples:
+        details.append(f"silence-filled samples={snapshot.buffer_underflow_samples}")
+    if snapshot.dropped_samples:
+        details.append(f"buffer-dropped samples={snapshot.dropped_samples}")
+    if snapshot.drift_correction_samples:
+        details.append(f"clock-drift corrections={snapshot.drift_correction_samples}")
+    if queue_is_low:
+        details.append("queue below low-water mark")
+    return ", ".join(details) if details else "no incidents"

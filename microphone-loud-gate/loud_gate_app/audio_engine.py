@@ -5,8 +5,100 @@ from __future__ import annotations
 import math
 import threading
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
+
+
+@dataclass(frozen=True, slots=True)
+class AudioHealthSnapshot:
+    """Callback and buffer incidents collected without doing I/O in callbacks."""
+
+    input_overflows: int = 0
+    input_underflows: int = 0
+    output_overflows: int = 0
+    output_underflows: int = 0
+    buffer_underflow_samples: int = 0
+    dropped_samples: int = 0
+    drift_correction_samples: int = 0
+
+    @property
+    def callback_status_events(self) -> int:
+        return (
+            self.input_overflows
+            + self.input_underflows
+            + self.output_overflows
+            + self.output_underflows
+        )
+
+    @property
+    def has_callback_status(self) -> bool:
+        return self.callback_status_events > 0
+
+    @property
+    def has_events(self) -> bool:
+        return self.has_callback_status or any(
+            (
+                self.buffer_underflow_samples,
+                self.dropped_samples,
+                self.drift_correction_samples,
+            )
+        )
+
+
+class AudioHealth:
+    """Thread-safe counters for facts that must leave the real-time callbacks."""
+
+    _COUNTER_NAMES = (
+        "input_overflows",
+        "input_underflows",
+        "output_overflows",
+        "output_underflows",
+        "buffer_underflow_samples",
+        "dropped_samples",
+        "drift_correction_samples",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counters = {name: 0 for name in self._COUNTER_NAMES}
+
+    def report_callback_status(self, direction: str, status) -> None:
+        if direction not in {"input", "output"} or status is None:
+            return
+
+        with self._lock:
+            for status_name, counter_name in (
+                ("overflow", f"{direction}_overflows"),
+                ("underflow", f"{direction}_underflows"),
+            ):
+                if bool(getattr(status, f"{direction}_{status_name}", False)):
+                    self._counters[counter_name] += 1
+
+    def report_buffer_underflow(self, sample_count: int) -> None:
+        if sample_count <= 0:
+            return
+        with self._lock:
+            self._counters["buffer_underflow_samples"] += int(sample_count)
+
+    def report_dropped_samples(self, sample_count: int) -> None:
+        if sample_count <= 0:
+            return
+        with self._lock:
+            self._counters["dropped_samples"] += int(sample_count)
+
+    def report_drift_correction(self, sample_count: int) -> None:
+        if sample_count <= 0:
+            return
+        with self._lock:
+            self._counters["drift_correction_samples"] += int(sample_count)
+
+    def consume(self) -> AudioHealthSnapshot:
+        with self._lock:
+            snapshot = AudioHealthSnapshot(**self._counters)
+            for name in self._COUNTER_NAMES:
+                self._counters[name] = 0
+            return snapshot
 
 
 class PcmRingBuffer:
@@ -43,18 +135,21 @@ class PcmRingBuffer:
             self._read_index = self._write_index
             self._size = 0
 
-    def write(self, samples: np.ndarray) -> int:
+    def write(self, samples: np.ndarray) -> tuple[int, int]:
         values = np.asarray(samples, dtype=np.int16)
         if values.ndim != 1 or values.size == 0:
-            return 0
+            return 0, 0
 
         with self._lock:
+            discarded = 0
             if values.size > self._capacity:
+                discarded += int(values.size - self._capacity)
                 values = values[-self._capacity :]
 
             count = int(values.size)
             overflow = max(0, self._size + count - self._capacity)
             if overflow:
+                discarded += overflow
                 self._read_index = (self._read_index + overflow) % self._capacity
                 self._size -= overflow
 
@@ -66,7 +161,18 @@ class PcmRingBuffer:
 
             self._write_index = (self._write_index + count) % self._capacity
             self._size += count
-            return count
+            return count, discarded
+
+    def discard_oldest(self, sample_count: int) -> int:
+        """Discard a bounded amount of old audio for elastic clock-drift control."""
+
+        if sample_count <= 0:
+            return 0
+        with self._lock:
+            discarded = min(int(sample_count), self._size)
+            self._read_index = (self._read_index + discarded) % self._capacity
+            self._size -= discarded
+            return discarded
 
     def read_into(self, destination: np.ndarray) -> int:
         """Read into a caller-owned 1-D destination and zero-fill any shortfall."""
@@ -221,12 +327,11 @@ class AudioEngine:
         self.mute_event = mute_event
         self.output_channels = int(output_channels)
         self.buffer = PcmRingBuffer(buffer_capacity_samples)
+        self.health = AudioHealth()
         self._output_was_muted = False
 
     def input_callback(self, indata, frames, time_info, status) -> None:
-        if status:
-            # Callback status handling is part of the runtime recovery phase.
-            pass
+        self.health.report_callback_status("input", status)
 
         muted = self.mute_event.is_set()
         incoming = np.asarray(indata[:, 0], dtype=np.float32) / 32768.0
@@ -235,12 +340,11 @@ class AudioEngine:
 
         if muted:
             self.buffer.clear()
-        self.buffer.write(pcm)
+        _, dropped_samples = self.buffer.write(pcm)
+        self.health.report_dropped_samples(dropped_samples)
 
     def output_callback(self, outdata, frames, time_info, status) -> None:
-        if status:
-            # Callback status handling is part of the runtime recovery phase.
-            pass
+        self.health.report_callback_status("output", status)
 
         if self.mute_event.is_set():
             self.buffer.clear()
@@ -253,6 +357,19 @@ class AudioEngine:
             self._output_was_muted = False
 
         mono_output = outdata[:, 0]
-        self.buffer.read_into(mono_output)
+        read_samples = self.buffer.read_into(mono_output)
+        self.health.report_buffer_underflow(mono_output.size - read_samples)
         if outdata.shape[1] > 1:
             outdata[:, 1:] = mono_output[:, None]
+
+    def rebalance_buffer(self, high_water_samples: int, max_drop_samples: int) -> int:
+        """Apply a small elastic correction when independent device clocks drift apart."""
+
+        available = self.buffer.available_samples
+        excess = max(0, available - int(high_water_samples))
+        if excess <= 0:
+            return 0
+
+        dropped = self.buffer.discard_oldest(min(excess, int(max_drop_samples)))
+        self.health.report_drift_correction(dropped)
+        return dropped
