@@ -414,8 +414,6 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 threshold_step_db,
             )
             lookahead_output_blocks = max(1, math.ceil(limiter.lookahead_ms / DEFAULT_BLOCK_MS))
-            max_buffer_blocks = max(16, lookahead_output_blocks * 6 + 4)
-            prefill_blocks = max(4, lookahead_output_blocks + 2)
             input_latency = max(
                 float(devices[in_idx].get("default_high_input_latency") or 0.0),
                 DEFAULT_STREAM_LATENCY_MS / 1000.0,
@@ -423,6 +421,15 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
             output_latency = max(
                 float(devices[out_idx].get("default_high_output_latency") or 0.0),
                 DEFAULT_STREAM_LATENCY_MS / 1000.0,
+            )
+            latency_blocks = math.ceil(
+                max(input_latency, output_latency) * 1000.0 / DEFAULT_BLOCK_MS
+            )
+            prefill_blocks = max(8, lookahead_output_blocks + 2, latency_blocks + 2)
+            max_buffer_blocks = max(
+                24,
+                lookahead_output_blocks * 6 + 4,
+                prefill_blocks * 3,
             )
             audio = AudioEngine(
                 limiter=limiter,
@@ -502,7 +509,6 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     )
                     low_water_samples = max(0, target_queue_samples - (2 * block_size))
                     callback_fault_streak = 0
-                    low_queue_streak = 0
                     last_health_log = 0.0
 
                     while not stop_event.wait(HEALTH_POLL_SECONDS):
@@ -522,23 +528,32 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                             not mute_event.is_set()
                             and queue_samples < low_water_samples
                         )
-                        low_queue_streak = low_queue_streak + 1 if queue_is_low else 0
 
                         if snapshot.has_callback_status or snapshot.buffer_underflow_samples:
                             callback_fault_streak += 1
                         else:
                             callback_fault_streak = 0
 
-                        if snapshot.has_events or queue_is_low:
+                        if snapshot.has_events:
                             now = time.monotonic()
                             if now - last_health_log >= HEALTH_LOG_INTERVAL_SECONDS:
-                                logger.warning(
-                                    "Audio health: %s; queue=%s/%s samples (%.1f%%).",
-                                    _describe_audio_health(snapshot, queue_is_low),
-                                    queue_samples,
-                                    audio.buffer.capacity_samples,
-                                    queue_ratio * 100.0,
+                                message = (
+                                    "Audio health: %s; queue=%s/%s samples (%.1f%%)."
+                                    % (
+                                        _describe_audio_health(snapshot, queue_is_low),
+                                        queue_samples,
+                                        audio.buffer.capacity_samples,
+                                        queue_ratio * 100.0,
+                                    )
                                 )
+                                if (
+                                    snapshot.has_callback_status
+                                    or snapshot.buffer_underflow_samples
+                                    or snapshot.dropped_samples
+                                ):
+                                    logger.warning(message)
+                                else:
+                                    logger.info(message)
                                 last_health_log = now
 
                         if callback_fault_streak >= HEALTH_RESTART_STREAK:
@@ -546,12 +561,6 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                                 "Audio callbacks reported stream faults for "
                                 f"{callback_fault_streak} consecutive health checks: "
                                 f"{_describe_audio_health(snapshot, queue_is_low)}"
-                            )
-
-                        if low_queue_streak >= HEALTH_RESTART_STREAK:
-                            raise RuntimeError(
-                                "Audio output queue remained below its low-water mark for "
-                                f"{low_queue_streak} consecutive health checks."
                             )
 
         except KeyboardInterrupt:
