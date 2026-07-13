@@ -1,18 +1,28 @@
-"""Audio-device discovery, matching, and stream capability checks."""
+"""Audio-device discovery and validated full-duplex pair selection."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import sounddevice as sd
 
 from .config import DEFAULT_SAMPLE_RATE, LoudGateConfig
 
 
+@dataclass(frozen=True, slots=True)
+class DevicePair:
+    """A full-duplex input/output pair proven openable by one PortAudio stream."""
+
+    input_index: int
+    output_index: int
+    input_channels: int
+    output_channels: int
+    sample_rate: int
+    hostapi: str
+
+
 def list_devices() -> list[dict]:
     return list(sd.query_devices())
-
-
-def compatible_device(device: dict, want_input: bool) -> bool:
-    return device["max_input_channels"] > 0 if want_input else device["max_output_channels"] > 0
 
 
 def normalize_name(name: str) -> str:
@@ -27,33 +37,8 @@ def hostapi_name(device: dict) -> str:
     return "unknown"
 
 
-def can_open_callback_stream(device_index: int, want_input: bool, channels: int, samplerate: int) -> bool:
-    def input_cb(indata, frames, time_info, status):
-        pass
-
-    def output_cb(outdata, frames, time_info, status):
-        outdata.fill(0)
-
-    try:
-        if want_input:
-            with sd.InputStream(
-                device=device_index,
-                samplerate=samplerate,
-                channels=channels,
-                dtype="int16",
-                callback=input_cb,
-            ):
-                return True
-        with sd.OutputStream(
-            device=device_index,
-            samplerate=samplerate,
-            channels=channels,
-            dtype="int16",
-            callback=output_cb,
-        ):
-            return True
-    except Exception:
-        return False
+def same_hostapi(input_device: dict, output_device: dict) -> bool:
+    return input_device.get("hostapi") == output_device.get("hostapi")
 
 
 def stream_channels(device: dict, want_input: bool) -> int:
@@ -61,38 +46,16 @@ def stream_channels(device: dict, want_input: bool) -> int:
     return max(1, min(2, int(device[key])))
 
 
-def stream_rate_candidates(device: dict) -> list[int]:
-    rates: list[int] = []
-    for rate in (
-        int(round(device.get("default_samplerate") or DEFAULT_SAMPLE_RATE)),
-        DEFAULT_SAMPLE_RATE,
-        48000,
-    ):
-        if rate not in rates:
-            rates.append(rate)
-    return rates
-
-
-def device_can_open_callback(devices: list[dict], device_index: int, want_input: bool) -> bool:
-    if not (0 <= device_index < len(devices)):
-        return False
-
-    device = devices[device_index]
-    if not compatible_device(device, want_input):
-        return False
-
-    channels = stream_channels(device, want_input)
-    return any(
-        can_open_callback_stream(device_index, want_input, channels, rate)
-        for rate in stream_rate_candidates(device)
-    )
+def compatible_device(device: dict, want_input: bool) -> bool:
+    key = "max_input_channels" if want_input else "max_output_channels"
+    return int(device.get(key) or 0) > 0
 
 
 def looks_like_physical_mic(name: str) -> bool:
-    n = normalize_name(name)
-    include = any(token in n for token in ("microphone", "mic", "headset", "capture"))
-    exclude = any(
-        token in n
+    normalized = normalize_name(name)
+    included = any(token in normalized for token in ("microphone", "mic", "headset", "capture"))
+    excluded = any(
+        token in normalized
         for token in (
             "cable",
             "vb-audio",
@@ -106,14 +69,14 @@ def looks_like_physical_mic(name: str) -> bool:
             "output",
         )
     )
-    return include and not exclude
+    return included and not excluded
 
 
 def looks_like_virtual_cable_output(name: str) -> bool:
-    n = normalize_name(name)
-    include = any(token in n for token in ("cable input", "virtual cable"))
-    exclude = any(
-        token in n
+    normalized = normalize_name(name)
+    included = any(token in normalized for token in ("cable input", "virtual cable"))
+    excluded = any(
+        token in normalized
         for token in (
             "cable output",
             "point",
@@ -125,91 +88,67 @@ def looks_like_virtual_cable_output(name: str) -> bool:
             "mic",
         )
     )
-    return include and not exclude
+    return included and not excluded
 
 
 def looks_like_virtual_output(name: str) -> bool:
     return looks_like_virtual_cable_output(name)
 
 
-def hostapi_rank(device: dict) -> int:
-    api = normalize_name(hostapi_name(device))
-    if "wdm-ks" in api:
+def hostapi_rank_name(name: str) -> int:
+    normalized = normalize_name(name)
+    if "wasapi" in normalized:
         return 0
-    if "wasapi" in api:
+    if "wdm-ks" in normalized:
         return 1
-    if "directsound" in api:
+    if "directsound" in normalized:
         return 2
-    if "mme" in api:
+    if "mme" in normalized:
         return 3
     return 4
 
 
-def sort_candidates(candidates: list[tuple[int, dict]]) -> list[tuple[int, dict]]:
-    def rank(item: tuple[int, dict]) -> tuple[int, str, int]:
-        idx, device = item
-        return hostapi_rank(device), normalize_name(str(device["name"])), idx
-
-    return sorted(candidates, key=rank)
+def hostapi_rank(device: dict) -> int:
+    return hostapi_rank_name(hostapi_name(device))
 
 
-def dedupe_candidates_by_name(candidates: list[tuple[int, dict]]) -> list[tuple[int, dict]]:
-    best_by_name: dict[str, tuple[int, dict]] = {}
-    for idx, device in candidates:
-        key = normalize_name(str(device["name"]))
-        current = best_by_name.get(key)
-        if current is None or hostapi_rank(device) < hostapi_rank(current[1]):
-            best_by_name[key] = (idx, device)
-    return list(best_by_name.values())
+def _unique_candidates(candidates: list[tuple[int, dict]]) -> list[tuple[int, dict]]:
+    unique: dict[tuple[str, str], tuple[int, dict]] = {}
+    for index, device in candidates:
+        key = (normalize_name(str(device["name"])), normalize_name(hostapi_name(device)))
+        unique.setdefault(key, (index, device))
+    return list(unique.values())
 
 
-def mic_name_rank(device: dict) -> int:
-    n = normalize_name(str(device["name"]))
-    if "maonocaster" in n:
+def _mic_name_rank(device: dict) -> int:
+    normalized = normalize_name(str(device["name"]))
+    if "maonocaster" in normalized:
         return 0
-    if "headset microphone" in n:
+    if "headset microphone" in normalized:
         return 1
-    if "microphone" in n:
+    if "microphone" in normalized:
         return 2
-    if "mic" in n:
+    if "mic" in normalized:
         return 3
     return 4
 
 
 def relevant_physical_mic_inputs(devices: list[dict]) -> list[tuple[int, dict]]:
-    filtered: list[tuple[int, dict]] = []
-
-    for idx, device in enumerate(devices):
-        if not compatible_device(device, True):
-            continue
-        name = str(device["name"])
-        if not looks_like_physical_mic(name):
-            continue
-        if not device_can_open_callback(devices, idx, True):
-            continue
-        filtered.append((idx, device))
-
-    if filtered:
-        unique = dedupe_candidates_by_name(filtered)
-        return sorted(
-            unique,
-            key=lambda item: (
-                mic_name_rank(item[1]),
-                hostapi_rank(item[1]),
-                normalize_name(str(item[1]["name"])),
-                item[0],
-            ),
-        )
-
-    for idx, device in enumerate(devices):
-        if not compatible_device(device, True):
-            continue
-        filtered.append((idx, device))
-    unique = dedupe_candidates_by_name(filtered)
+    candidates = [
+        (index, device)
+        for index, device in enumerate(devices)
+        if compatible_device(device, True) and looks_like_physical_mic(str(device["name"]))
+    ]
+    if not candidates:
+        candidates = [
+            (index, device)
+            for index, device in enumerate(devices)
+            if compatible_device(device, True)
+        ]
     return sorted(
-        unique,
+        _unique_candidates(candidates),
         key=lambda item: (
-            mic_name_rank(item[1]),
+            _mic_name_rank(item[1]),
             hostapi_rank(item[1]),
             normalize_name(str(item[1]["name"])),
             item[0],
@@ -218,87 +157,192 @@ def relevant_physical_mic_inputs(devices: list[dict]) -> list[tuple[int, dict]]:
 
 
 def relevant_virtual_cable_outputs(devices: list[dict]) -> list[tuple[int, dict]]:
-    filtered: list[tuple[int, dict]] = []
+    candidates = [
+        (index, device)
+        for index, device in enumerate(devices)
+        if compatible_device(device, False)
+        and looks_like_virtual_cable_output(str(device["name"]))
+    ]
+    return sorted(
+        _unique_candidates(candidates),
+        key=lambda item: (
+            hostapi_rank(item[1]),
+            normalize_name(str(item[1]["name"])),
+            item[0],
+        ),
+    )
 
-    for idx, device in enumerate(devices):
-        if not compatible_device(device, False):
-            continue
-        name = str(device["name"])
-        if not looks_like_virtual_cable_output(name):
-            continue
-        if not device_can_open_callback(devices, idx, False):
-            continue
-        filtered.append((idx, device))
 
-    return sort_candidates(dedupe_candidates_by_name(filtered))
+def _rate_candidates(
+    input_device: dict,
+    output_device: dict,
+    preferred_rate: int | None,
+) -> list[int]:
+    candidates: list[int] = []
+    for rate in (
+        preferred_rate,
+        DEFAULT_SAMPLE_RATE,
+        int(round(input_device.get("default_samplerate") or DEFAULT_SAMPLE_RATE)),
+        int(round(output_device.get("default_samplerate") or DEFAULT_SAMPLE_RATE)),
+        48000,
+    ):
+        if rate is not None and rate not in candidates:
+            candidates.append(int(rate))
+    return candidates
 
 
-def resolve_device_index(
-    devices: list[dict], cfg: LoudGateConfig, key: str, want_input: bool
-) -> int | None:
-    idx_key = f"{key}_device_index"
-    name_key = f"{key}_device_name"
-    hostapi_key = f"{key}_device_hostapi"
-    stored_idx = getattr(cfg, idx_key)
-    stored_name = getattr(cfg, name_key)
-    stored_hostapi = getattr(cfg, hostapi_key)
-    stored_hostapi_norm = normalize_name(stored_hostapi) if isinstance(stored_hostapi, str) else None
+def can_open_full_duplex_stream(
+    input_index: int,
+    output_index: int,
+    input_channels: int,
+    output_channels: int,
+    sample_rate: int,
+) -> bool:
+    """Open and close the exact pair without starting audio callbacks."""
 
-    def matches(device: dict) -> bool:
-        if stored_name and device["name"] != stored_name:
-            return False
-        if stored_hostapi_norm and normalize_name(hostapi_name(device)) != stored_hostapi_norm:
-            return False
+    def callback(indata, outdata, frames, time_info, status):
+        outdata.fill(0)
+
+    stream = None
+    try:
+        stream = sd.Stream(
+            device=(input_index, output_index),
+            channels=(input_channels, output_channels),
+            samplerate=sample_rate,
+            blocksize=0,
+            dtype=("float32", "float32"),
+            latency=("high", "high"),
+            callback=callback,
+        )
         return True
+    except Exception:
+        return False
+    finally:
+        if stream is not None:
+            stream.close()
 
-    if isinstance(stored_idx, int) and 0 <= stored_idx < len(devices):
-        device = devices[stored_idx]
-        if compatible_device(device, want_input) and matches(device) and device_can_open_callback(devices, stored_idx, want_input):
-            return stored_idx
 
-    if stored_name:
-        for i, device in enumerate(devices):
-            if not compatible_device(device, want_input):
-                continue
-            if matches(device) and device_can_open_callback(devices, i, want_input):
-                return i
+def resolve_pair_format(
+    devices: list[dict],
+    input_index: int,
+    output_index: int,
+    preferred_rate: int | None = None,
+) -> DevicePair | None:
+    input_device = devices[input_index]
+    output_device = devices[output_index]
+    if not same_hostapi(input_device, output_device):
+        return None
 
-        lowered = stored_name.lower()
-        for i, device in enumerate(devices):
-            if not compatible_device(device, want_input):
-                continue
-            if lowered in device["name"].lower():
-                if stored_hostapi_norm and normalize_name(hostapi_name(device)) != stored_hostapi_norm:
-                    continue
-                if not device_can_open_callback(devices, i, want_input):
-                    continue
-                return i
-
+    input_channels = stream_channels(input_device, True)
+    output_channels = stream_channels(output_device, False)
+    for sample_rate in _rate_candidates(input_device, output_device, preferred_rate):
+        if can_open_full_duplex_stream(
+            input_index,
+            output_index,
+            input_channels,
+            output_channels,
+            sample_rate,
+        ):
+            return DevicePair(
+                input_index=input_index,
+                output_index=output_index,
+                input_channels=input_channels,
+                output_channels=output_channels,
+                sample_rate=sample_rate,
+                hostapi=hostapi_name(input_device),
+            )
     return None
 
 
-def resolve_sample_rate(
+def relevant_device_pairs(devices: list[dict]) -> list[DevicePair]:
+    pairs: list[DevicePair] = []
+    for input_index, input_device in relevant_physical_mic_inputs(devices):
+        for output_index, output_device in relevant_virtual_cable_outputs(devices):
+            if not same_hostapi(input_device, output_device):
+                continue
+            pair = resolve_pair_format(devices, input_index, output_index)
+            if pair is not None:
+                pairs.append(pair)
+    return sorted(
+        pairs,
+        key=lambda pair: (
+            hostapi_rank_name(pair.hostapi),
+            _mic_name_rank(devices[pair.input_index]),
+            normalize_name(str(devices[pair.input_index]["name"])),
+            pair.input_index,
+            pair.output_index,
+        ),
+    )
+
+
+def _stored_device_candidates(
     devices: list[dict],
-    in_idx: int,
-    out_idx: int,
-    input_channels: int,
-    output_channels: int,
-) -> int:
+    stored_index: int | None,
+    stored_name: str | None,
+    stored_hostapi: str | None,
+    want_input: bool,
+) -> list[int]:
+    if not stored_name:
+        return []
+
+    normalized_name = normalize_name(stored_name)
+    normalized_api = normalize_name(stored_hostapi or "")
     candidates: list[int] = []
-    for rate in (
-        DEFAULT_SAMPLE_RATE,
-        int(round(devices[in_idx].get("default_samplerate") or DEFAULT_SAMPLE_RATE)),
-        int(round(devices[out_idx].get("default_samplerate") or DEFAULT_SAMPLE_RATE)),
-        48000,
-    ):
-        if rate not in candidates:
-            candidates.append(rate)
-
-    for rate in candidates:
-        try:
-            if can_open_callback_stream(in_idx, True, input_channels, rate) and can_open_callback_stream(out_idx, False, output_channels, rate):
-                return rate
-        except Exception:
+    for index, device in enumerate(devices):
+        if not compatible_device(device, want_input):
             continue
+        candidate_name = normalize_name(str(device["name"]))
+        if candidate_name != normalized_name and normalized_name not in candidate_name:
+            continue
+        candidates.append(index)
 
-    raise RuntimeError("No common sample rate found for the selected input/output devices.")
+    return sorted(
+        candidates,
+        key=lambda index: (
+            0 if index == stored_index else 1,
+            0 if normalize_name(hostapi_name(devices[index])) == normalized_api else 1,
+            hostapi_rank(devices[index]),
+            index,
+        ),
+    )
+
+
+def resolve_device_pair(devices: list[dict], cfg: LoudGateConfig) -> DevicePair | None:
+    """Resolve saved names to a same-backend pair and validate the exact stream."""
+
+    input_candidates = _stored_device_candidates(
+        devices,
+        cfg.input_device_index,
+        cfg.input_device_name,
+        cfg.input_device_hostapi,
+        True,
+    )
+    output_candidates = _stored_device_candidates(
+        devices,
+        cfg.output_device_index,
+        cfg.output_device_name,
+        cfg.output_device_hostapi,
+        False,
+    )
+
+    candidate_pairs: list[tuple[int, int, int, int]] = []
+    for input_index in input_candidates:
+        for output_index in output_candidates:
+            if not same_hostapi(devices[input_index], devices[output_index]):
+                continue
+            api_rank = hostapi_rank(devices[input_index])
+            index_penalty = int(input_index != cfg.input_device_index) + int(
+                output_index != cfg.output_device_index
+            )
+            candidate_pairs.append((api_rank, index_penalty, input_index, output_index))
+
+    for _, _, input_index, output_index in sorted(candidate_pairs):
+        pair = resolve_pair_format(
+            devices,
+            input_index,
+            output_index,
+            preferred_rate=cfg.sample_rate,
+        )
+        if pair is not None:
+            return pair
+    return None

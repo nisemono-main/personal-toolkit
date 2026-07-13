@@ -1,2 +1,2 @@
-numpy
-sounddevice
+numpy==2.5.0
+sounddevice==0.5.5

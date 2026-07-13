@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 APP_NAME = "loud-gate"
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 CONFIG_SECTION = "loud-gate"
 HOTKEY_CONFIG_SECTION = "hotkeys"
 
@@ -34,9 +34,11 @@ class LoudGateConfig:
     input_device_index: int | None = None
     input_device_name: str | None = None
     input_device_hostapi: str | None = None
+    input_channel: int = 0
     output_device_index: int | None = None
     output_device_name: str | None = None
     output_device_hostapi: str | None = None
+    sample_rate: int = DEFAULT_SAMPLE_RATE
     threshold_db: float = DEFAULT_THRESHOLD_DB
     release_ms: float = DEFAULT_RELEASE_MS
     lookahead_ms: float = DEFAULT_LOOKAHEAD_MS
@@ -51,10 +53,10 @@ class LoudGateConfig:
         return all(
             value is not None
             for value in (
-                self.input_device_index,
                 self.input_device_name,
-                self.output_device_index,
+                self.input_device_hostapi,
                 self.output_device_name,
+                self.output_device_hostapi,
             )
         )
 
@@ -70,6 +72,16 @@ class LoudGateConfig:
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
             ):
                 raise ConfigError(f"{field_name} must be a non-negative integer or blank.")
+
+        if isinstance(self.input_channel, bool) or not isinstance(self.input_channel, int):
+            raise ConfigError("input_channel must be a non-negative integer.")
+        if self.input_channel < 0:
+            raise ConfigError("input_channel must be a non-negative integer.")
+
+        if isinstance(self.sample_rate, bool) or not isinstance(self.sample_rate, int):
+            raise ConfigError("sample_rate must be an integer.")
+        if not 8000 <= self.sample_rate <= 384000:
+            raise ConfigError("sample_rate must be between 8000 and 384000 Hz.")
 
         for field_name in (
             "input_device_name",
@@ -221,8 +233,17 @@ def _parse_config(parser: configparser.ConfigParser, path: Path) -> tuple[LoudGa
     )
     cfg.input_device_name = _parse_text(_section_value(data, "input_device_name"), None)
     cfg.input_device_hostapi = _parse_text(_section_value(data, "input_device_hostapi"), None)
+    cfg.input_channel = _parse_optional_int(
+        _section_value(data, "input_channel"), "input_channel"
+    )
+    if cfg.input_channel is None:
+        cfg.input_channel = 0
     cfg.output_device_name = _parse_text(_section_value(data, "output_device_name"), None)
     cfg.output_device_hostapi = _parse_text(_section_value(data, "output_device_hostapi"), None)
+    parsed_sample_rate = _parse_optional_int(
+        _section_value(data, "sample_rate"), "sample_rate"
+    )
+    cfg.sample_rate = parsed_sample_rate or DEFAULT_SAMPLE_RATE
     cfg.threshold_db = _parse_float(_section_value(data, "threshold_db"), "threshold_db", cfg.threshold_db)
     cfg.release_ms = _parse_float(_section_value(data, "release_ms"), "release_ms", cfg.release_ms)
     cfg.lookahead_ms = _parse_float(_section_value(data, "lookahead_ms"), "lookahead_ms", cfg.lookahead_ms)

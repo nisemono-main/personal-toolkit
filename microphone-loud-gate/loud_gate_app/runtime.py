@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ctypes
 import logging
-import math
 import signal
 import threading
 import time
@@ -14,19 +13,15 @@ from typing import Callable
 import sounddevice as sd
 from ctypes import wintypes
 
-from .audio_engine import AudioEngine, AudioHealthSnapshot, LookaheadLimiter
+from .audio_engine import AudioControls, AudioEngine, AudioHealthSnapshot, LookaheadLimiter
 from .config import MAX_THRESHOLD_DB, MIN_THRESHOLD_DB, LoudGateConfig, save_config
 from .devices import (
-    hostapi_name,
     list_devices,
     looks_like_virtual_output,
-    resolve_device_index,
-    resolve_sample_rate,
+    resolve_device_pair,
 )
 
 
-DEFAULT_BLOCK_MS = 10.0
-DEFAULT_STREAM_LATENCY_MS = 100.0
 STARTUP_RETRY_LIMIT = 3
 RETRY_DELAY_SECONDS = 5.0
 HEALTH_POLL_SECONDS = 0.25
@@ -284,8 +279,11 @@ class GlobalHotkeyManager:
                 user32.UnregisterHotKey(None, hotkey_id)
 
 
-def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> None:
-    mute_event = threading.Event()
+def run_service(
+    cfg: LoudGateConfig,
+    logger: logging.Logger,
+    verbose: bool,
+) -> None:
     stop_event = threading.Event()
     hotkeys = configured_hotkeys(cfg)
     try:
@@ -310,65 +308,73 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
             phase = "device discovery"
             devices = list_devices()
             phase = "device resolution"
-            in_idx = resolve_device_index(devices, cfg, "input", want_input=True)
-            out_idx = resolve_device_index(devices, cfg, "output", want_input=False)
-
-            if in_idx is None or out_idx is None:
+            pair = resolve_device_pair(devices, cfg)
+            if pair is None:
                 raise RuntimeError(
-                    "Saved devices were not found. Re-run the script interactively to reselect them."
+                    "The saved devices could not be opened as one same-backend full-duplex stream. "
+                    "Run loud_gate.py --setup and select a validated route."
                 )
 
-            saved_input_idx = cfg.input_device_index
-            saved_output_idx = cfg.output_device_index
-            if in_idx != saved_input_idx or out_idx != saved_output_idx:
-                cfg.input_device_index = in_idx
-                cfg.input_device_name = devices[in_idx]["name"]
-                cfg.input_device_hostapi = hostapi_name(devices[in_idx])
-                cfg.output_device_index = out_idx
-                cfg.output_device_name = devices[out_idx]["name"]
-                cfg.output_device_hostapi = hostapi_name(devices[out_idx])
+            if not 0 <= cfg.input_channel < pair.input_channels:
+                raise RuntimeError(
+                    f"Configured input_channel={cfg.input_channel} is unavailable; "
+                    f"the selected input exposes {pair.input_channels} channels. Run --setup."
+                )
+
+            resolved_values = {
+                "input_device_index": pair.input_index,
+                "input_device_name": str(devices[pair.input_index]["name"]),
+                "input_device_hostapi": pair.hostapi,
+                "output_device_index": pair.output_index,
+                "output_device_name": str(devices[pair.output_index]["name"]),
+                "output_device_hostapi": pair.hostapi,
+                "sample_rate": pair.sample_rate,
+            }
+            config_changed = any(
+                getattr(cfg, field_name) != value
+                for field_name, value in resolved_values.items()
+            )
+            if config_changed:
+                for field_name, value in resolved_values.items():
+                    setattr(cfg, field_name, value)
                 try:
                     save_config(cfg)
                     logger.info(
-                        "Resolved saved devices to input=%s (%s), output=%s (%s) and updated config.",
-                        in_idx,
-                        devices[in_idx]["name"],
-                        out_idx,
-                        devices[out_idx]["name"],
+                        "Resolved and saved full-duplex route: input=%s, output=%s, hostapi=%s, rate=%s Hz.",
+                        pair.input_index,
+                        pair.output_index,
+                        pair.hostapi,
+                        pair.sample_rate,
                     )
                 except Exception as exc:
                     logger.warning("Resolved devices but failed to save config: %s", exc)
 
-            if not looks_like_virtual_output(devices[out_idx]["name"]):
+            if not looks_like_virtual_output(devices[pair.output_index]["name"]):
                 logger.warning(
                     "Selected output '%s' does not look like a VB-Cable playback device.",
-                    devices[out_idx]["name"],
+                    devices[pair.output_index]["name"],
                 )
 
             phase = "stream configuration"
-            input_channels = max(1, min(2, int(devices[in_idx]["max_input_channels"])))
-            output_channels = max(1, min(2, int(devices[out_idx]["max_output_channels"])))
-            sample_rate = resolve_sample_rate(devices, in_idx, out_idx, input_channels, output_channels)
-            block_size = int(round(sample_rate * (DEFAULT_BLOCK_MS / 1000.0)))
+            controls = AudioControls(threshold_db=float(cfg.threshold_db))
             limiter = LookaheadLimiter(
-                threshold_db=float(cfg.threshold_db),
+                controls=controls,
                 release_ms=float(cfg.release_ms),
                 lookahead_ms=float(cfg.lookahead_ms),
-                sample_rate=sample_rate,
-                block_size=block_size,
+                sample_rate=pair.sample_rate,
             )
 
             def adjust_threshold(delta_db: float) -> None:
-                previous_threshold = cfg.threshold_db
-                new_threshold = limiter.adjust_threshold_db(delta_db)
+                previous_threshold = float(controls.threshold_db)
+                new_threshold = previous_threshold + float(delta_db)
                 if not (MIN_THRESHOLD_DB <= new_threshold <= MAX_THRESHOLD_DB):
-                    limiter.set_threshold_db(previous_threshold)
                     logger.warning(
                         "Threshold remains at %.1f dBFS; requested value %.1f is outside the supported range.",
                         previous_threshold,
                         new_threshold,
                     )
                     return
+                controls.set_threshold_db(new_threshold)
                 cfg.threshold_db = new_threshold
                 try:
                     save_config(cfg)
@@ -384,11 +390,10 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
             }
 
             def toggle_mute() -> None:
-                if mute_event.is_set():
-                    mute_event.clear()
+                controls.muted = not controls.muted
+                if not controls.muted:
                     logger.info("%s: mic unmuted", binding_labels["mute"])
                 else:
-                    mute_event.set()
                     logger.info("%s: mic muted", binding_labels["mute"])
 
             def request_stop() -> None:
@@ -406,36 +411,18 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 for binding in hotkeys.values()
             }
 
-            phase = "buffer and hotkey setup"
+            phase = "audio and hotkey setup"
             hotkey = GlobalHotkeyManager(
                 logger,
                 hotkeys,
                 actions,
                 threshold_step_db,
             )
-            lookahead_output_blocks = max(1, math.ceil(limiter.lookahead_ms / DEFAULT_BLOCK_MS))
-            input_latency = max(
-                float(devices[in_idx].get("default_high_input_latency") or 0.0),
-                DEFAULT_STREAM_LATENCY_MS / 1000.0,
-            )
-            output_latency = max(
-                float(devices[out_idx].get("default_high_output_latency") or 0.0),
-                DEFAULT_STREAM_LATENCY_MS / 1000.0,
-            )
-            latency_blocks = math.ceil(
-                max(input_latency, output_latency) * 1000.0 / DEFAULT_BLOCK_MS
-            )
-            prefill_blocks = max(8, lookahead_output_blocks + 2, latency_blocks + 2)
-            max_buffer_blocks = max(
-                24,
-                lookahead_output_blocks * 6 + 4,
-                prefill_blocks * 3,
-            )
             audio = AudioEngine(
                 limiter=limiter,
-                mute_event=mute_event,
-                output_channels=output_channels,
-                buffer_capacity_samples=max_buffer_blocks * block_size,
+                controls=controls,
+                input_channel=cfg.input_channel,
+                output_channels=pair.output_channels,
             )
 
             phase = "hotkey registration"
@@ -444,116 +431,92 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 break
 
             logger.info(
-                "Running with input='%s', output='%s', sample_rate=%s, block_size=%s, in_channels=%s, out_channels=%s, threshold=%.1f dBFS, release=%.1f ms, lookahead=%.1f ms",
-                devices[in_idx]["name"],
-                devices[out_idx]["name"],
-                sample_rate,
-                block_size,
-                input_channels,
-                output_channels,
-                limiter.get_threshold_db(),
+                "Opening full-duplex stream: input='%s', output='%s', hostapi='%s', sample_rate=%s, input_channel=%s/%s, output_channels=%s, threshold=%.1f dBFS, release=%.1f ms, lookahead=%.1f ms",
+                devices[pair.input_index]["name"],
+                devices[pair.output_index]["name"],
+                pair.hostapi,
+                pair.sample_rate,
+                cfg.input_channel,
+                pair.input_channels,
+                pair.output_channels,
+                controls.threshold_db,
                 float(cfg.release_ms),
                 float(cfg.lookahead_ms),
             )
 
             if verbose:
                 print(
-                    f"Running. {cfg.mute_hotkey} toggles mute. Input = {devices[in_idx]['name']}. "
-                    f"Output = {devices[out_idx]['name']}.",
+                    f"Running. {cfg.mute_hotkey} toggles mute. "
+                    f"Input = {devices[pair.input_index]['name']}. "
+                    f"Output = {devices[pair.output_index]['name']}.",
                     flush=True,
                 )
 
-            phase = "input stream startup"
-            with sd.InputStream(
-                samplerate=sample_rate,
-                blocksize=block_size,
-                dtype="int16",
-                channels=input_channels,
-                device=in_idx,
-                callback=audio.input_callback,
-                latency=input_latency,
-            ):
-                while not stop_event.is_set():
-                    ready_samples = audio.buffer.available_samples
-                    if ready_samples >= prefill_blocks * block_size:
-                        break
-                    if stop_event.wait(0.05):
-                        break
+            phase = "full-duplex stream startup"
+            with sd.Stream(
+                samplerate=pair.sample_rate,
+                blocksize=0,
+                dtype=("float32", "float32"),
+                channels=(pair.input_channels, pair.output_channels),
+                device=(pair.input_index, pair.output_index),
+                callback=audio.callback,
+                latency=("high", "high"),
+            ) as stream:
+                startup_complete = True
+                has_started_once = True
+                startup_attempts = 0
+                logger.info(
+                    "Full-duplex audio ready; actual latency=%s seconds, lookahead=%s samples.",
+                    stream.latency,
+                    limiter.lookahead_samples,
+                )
 
-                if stop_event.is_set():
-                    break
+                previous_health = audio.health.snapshot()
+                callback_fault_streak = 0
+                last_health_log = 0.0
 
-                phase = "output stream startup"
-                with sd.OutputStream(
-                    samplerate=sample_rate,
-                    blocksize=block_size,
-                    dtype="int16",
-                    channels=output_channels,
-                    device=out_idx,
-                    callback=audio.output_callback,
-                    latency=output_latency,
-                ):
-                    startup_complete = True
-                    has_started_once = True
-                    startup_attempts = 0
-                    logger.info(
-                        "Audio streams ready; queue target=%s samples, capacity=%s samples.",
-                        prefill_blocks * block_size,
-                        audio.buffer.capacity_samples,
+                while not stop_event.wait(HEALTH_POLL_SECONDS):
+                    phase = "audio health monitoring"
+                    if hotkey.failure is not None:
+                        raise RuntimeError(
+                            "The global hotkey thread stopped unexpectedly."
+                        ) from hotkey.failure
+                    if not stream.active:
+                        raise RuntimeError("The full-duplex audio stream became inactive.")
+
+                    current_health = audio.health.snapshot()
+                    incidents = current_health.since(previous_health)
+                    previous_health = current_health
+                    if incidents.incident_count:
+                        callback_fault_streak += 1
+                    else:
+                        callback_fault_streak = 0
+
+                    cpu_load = float(stream.cpu_load)
+                    now = time.monotonic()
+                    has_observations = bool(
+                        incidents.incident_count or incidents.clipped_input_callbacks
                     )
-
-                    target_queue_samples = prefill_blocks * block_size
-                    low_water_samples = max(0, target_queue_samples - (2 * block_size))
-                    callback_fault_streak = 0
-                    last_health_log = 0.0
-
-                    while not stop_event.wait(HEALTH_POLL_SECONDS):
-                        phase = "audio health monitoring"
-                        if hotkey.failure is not None:
-                            raise RuntimeError(
-                                "The global hotkey thread stopped unexpectedly."
-                            ) from hotkey.failure
-                        snapshot = audio.health.consume()
-                        queue_samples = audio.buffer.available_samples
-                        queue_ratio = queue_samples / float(audio.buffer.capacity_samples)
-                        queue_is_low = (
-                            not mute_event.is_set()
-                            and queue_samples < low_water_samples
+                    if has_observations and now - last_health_log >= HEALTH_LOG_INTERVAL_SECONDS:
+                        message = _describe_audio_health(incidents)
+                        if incidents.callback_errors and audio.health.last_error is not None:
+                            message += f"; last callback error={audio.health.last_error}"
+                        logger.warning(
+                            "Audio health: %s; callback CPU load=%.1f%%.",
+                            message,
+                            cpu_load * 100.0,
                         )
+                        last_health_log = now
+                    elif cpu_load >= 0.8 and now - last_health_log >= HEALTH_LOG_INTERVAL_SECONDS:
+                        logger.warning("Audio callback CPU load is high: %.1f%%.", cpu_load * 100.0)
+                        last_health_log = now
 
-                        if snapshot.has_callback_status or snapshot.buffer_underflow_samples:
-                            callback_fault_streak += 1
-                        else:
-                            callback_fault_streak = 0
-
-                        if snapshot.has_events:
-                            now = time.monotonic()
-                            if now - last_health_log >= HEALTH_LOG_INTERVAL_SECONDS:
-                                message = (
-                                    "Audio health: %s; queue=%s/%s samples (%.1f%%)."
-                                    % (
-                                        _describe_audio_health(snapshot, queue_is_low),
-                                        queue_samples,
-                                        audio.buffer.capacity_samples,
-                                        queue_ratio * 100.0,
-                                    )
-                                )
-                                if (
-                                    snapshot.has_callback_status
-                                    or snapshot.buffer_underflow_samples
-                                    or snapshot.dropped_samples
-                                ):
-                                    logger.warning(message)
-                                else:
-                                    logger.info(message)
-                                last_health_log = now
-
-                        if callback_fault_streak >= HEALTH_RESTART_STREAK:
-                            raise RuntimeError(
-                                "Audio callbacks reported stream faults for "
-                                f"{callback_fault_streak} consecutive health checks: "
-                                f"{_describe_audio_health(snapshot, queue_is_low)}"
-                            )
+                    if callback_fault_streak >= HEALTH_RESTART_STREAK:
+                        raise RuntimeError(
+                            "Audio callbacks reported faults for "
+                            f"{callback_fault_streak} consecutive health checks: "
+                            f"{_describe_audio_health(incidents)}"
+                        )
 
         except KeyboardInterrupt:
             stop_event.set()
@@ -592,7 +555,7 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     logger.exception("Failed to cleanly stop the global hotkey manager.")
 
 
-def _describe_audio_health(snapshot: AudioHealthSnapshot, queue_is_low: bool) -> str:
+def _describe_audio_health(snapshot: AudioHealthSnapshot) -> str:
     details: list[str] = []
     if snapshot.input_overflows:
         details.append(f"input overflows={snapshot.input_overflows}")
@@ -602,10 +565,10 @@ def _describe_audio_health(snapshot: AudioHealthSnapshot, queue_is_low: bool) ->
         details.append(f"output overflows={snapshot.output_overflows}")
     if snapshot.output_underflows:
         details.append(f"output underflows={snapshot.output_underflows}")
-    if snapshot.buffer_underflow_samples:
-        details.append(f"silence-filled samples={snapshot.buffer_underflow_samples}")
-    if snapshot.dropped_samples:
-        details.append(f"buffer-dropped samples={snapshot.dropped_samples}")
-    if queue_is_low:
-        details.append("queue below low-water mark")
+    if snapshot.callback_errors:
+        details.append(f"callback errors={snapshot.callback_errors}")
+    if snapshot.oversized_callbacks:
+        details.append(f"oversized callbacks={snapshot.oversized_callbacks}")
+    if snapshot.clipped_input_callbacks:
+        details.append(f"full-scale input callbacks={snapshot.clipped_input_callbacks}")
     return ", ".join(details) if details else "no incidents"

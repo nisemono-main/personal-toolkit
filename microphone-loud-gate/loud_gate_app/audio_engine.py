@@ -1,354 +1,279 @@
-"""Real-time-oriented limiter and PCM buffering primitives for Loud Gate."""
+"""Sample-accurate limiter and full-duplex callback for Loud Gate."""
 
 from __future__ import annotations
 
 import math
-import threading
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 
 
+DEFAULT_MAX_CALLBACK_FRAMES = 16384
+MUTE_RAMP_MS = 5.0
+
+
+@dataclass(slots=True)
+class AudioControls:
+    """Small callback-readable control snapshot updated by the hotkey thread."""
+
+    threshold_db: float
+    muted: bool = False
+
+    def set_threshold_db(self, threshold_db: float) -> float:
+        self.threshold_db = float(threshold_db)
+        return self.threshold_db
+
+    def adjust_threshold_db(self, delta_db: float) -> float:
+        self.threshold_db = float(self.threshold_db + float(delta_db))
+        return self.threshold_db
+
+
 @dataclass(frozen=True, slots=True)
 class AudioHealthSnapshot:
-    """Callback and buffer incidents collected without doing I/O in callbacks."""
+    """Monotonic facts written by the callback and sampled by the control thread."""
 
+    callbacks: int = 0
+    frames: int = 0
     input_overflows: int = 0
     input_underflows: int = 0
     output_overflows: int = 0
     output_underflows: int = 0
-    buffer_underflow_samples: int = 0
-    dropped_samples: int = 0
+    callback_errors: int = 0
+    oversized_callbacks: int = 0
+    clipped_input_callbacks: int = 0
 
     @property
-    def callback_status_events(self) -> int:
+    def incident_count(self) -> int:
         return (
             self.input_overflows
             + self.input_underflows
             + self.output_overflows
             + self.output_underflows
+            + self.callback_errors
+            + self.oversized_callbacks
         )
 
-    @property
-    def has_callback_status(self) -> bool:
-        return self.callback_status_events > 0
-
-    @property
-    def has_events(self) -> bool:
-        return self.has_callback_status or any(
-            (
-                self.buffer_underflow_samples,
-                self.dropped_samples,
-            )
+    def since(self, previous: "AudioHealthSnapshot") -> "AudioHealthSnapshot":
+        return AudioHealthSnapshot(
+            **{
+                field_name: max(0, getattr(self, field_name) - getattr(previous, field_name))
+                for field_name in self.__dataclass_fields__
+            }
         )
 
 
 class AudioHealth:
-    """Thread-safe counters for facts that must leave the real-time callbacks."""
-
-    _COUNTER_NAMES = (
-        "input_overflows",
-        "input_underflows",
-        "output_overflows",
-        "output_underflows",
-        "buffer_underflow_samples",
-        "dropped_samples",
-    )
+    """Single-callback-writer counters that never acquire a callback-side lock."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._counters = {name: 0 for name in self._COUNTER_NAMES}
+        self.callbacks = 0
+        self.frames = 0
+        self.input_overflows = 0
+        self.input_underflows = 0
+        self.output_overflows = 0
+        self.output_underflows = 0
+        self.callback_errors = 0
+        self.oversized_callbacks = 0
+        self.clipped_input_callbacks = 0
+        self.last_error: BaseException | None = None
 
-    def report_callback_status(self, direction: str, status) -> None:
-        if direction not in {"input", "output"} or status is None:
+    def report_status(self, status) -> None:
+        if status is None:
             return
+        for status_name in (
+            "input_overflow",
+            "input_underflow",
+            "output_overflow",
+            "output_underflow",
+        ):
+            if bool(getattr(status, status_name, False)):
+                counter_name = f"{status_name}s"
+                setattr(self, counter_name, getattr(self, counter_name) + 1)
 
-        with self._lock:
-            for status_name, counter_name in (
-                ("overflow", f"{direction}_overflows"),
-                ("underflow", f"{direction}_underflows"),
-            ):
-                if bool(getattr(status, f"{direction}_{status_name}", False)):
-                    self._counters[counter_name] += 1
-
-    def report_buffer_underflow(self, sample_count: int) -> None:
-        if sample_count <= 0:
-            return
-        with self._lock:
-            self._counters["buffer_underflow_samples"] += int(sample_count)
-
-    def report_dropped_samples(self, sample_count: int) -> None:
-        if sample_count <= 0:
-            return
-        with self._lock:
-            self._counters["dropped_samples"] += int(sample_count)
-
-    def consume(self) -> AudioHealthSnapshot:
-        with self._lock:
-            snapshot = AudioHealthSnapshot(**self._counters)
-            for name in self._COUNTER_NAMES:
-                self._counters[name] = 0
-            return snapshot
-
-
-class PcmRingBuffer:
-    """Bounded single-producer/single-consumer mono PCM sample buffer.
-
-    The input callback is the producer and the output callback is the consumer.
-    A narrow lock protects the small NumPy copy and index-update region because
-    NumPy may release the interpreter lock during those copies. The expensive
-    limiter work happens outside this lock. When full, the oldest samples are
-    discarded to keep latency bounded and favor current microphone audio.
-    """
-
-    def __init__(self, capacity_samples: int) -> None:
-        if capacity_samples <= 0:
-            raise ValueError("capacity_samples must be greater than zero.")
-        self._storage = np.zeros(int(capacity_samples), dtype=np.int16)
-        self._capacity = int(capacity_samples)
-        self._read_index = 0
-        self._write_index = 0
-        self._size = 0
-        self._lock = threading.Lock()
-
-    @property
-    def capacity_samples(self) -> int:
-        return self._capacity
-
-    @property
-    def available_samples(self) -> int:
-        with self._lock:
-            return self._size
-
-    def clear(self) -> None:
-        with self._lock:
-            self._read_index = self._write_index
-            self._size = 0
-
-    def write(self, samples: np.ndarray) -> tuple[int, int]:
-        values = np.asarray(samples, dtype=np.int16)
-        if values.ndim != 1 or values.size == 0:
-            return 0, 0
-
-        with self._lock:
-            discarded = 0
-            if values.size > self._capacity:
-                discarded += int(values.size - self._capacity)
-                values = values[-self._capacity :]
-
-            count = int(values.size)
-            overflow = max(0, self._size + count - self._capacity)
-            if overflow:
-                discarded += overflow
-                self._read_index = (self._read_index + overflow) % self._capacity
-                self._size -= overflow
-
-            first = min(count, self._capacity - self._write_index)
-            self._storage[self._write_index : self._write_index + first] = values[:first]
-            remaining = count - first
-            if remaining:
-                self._storage[:remaining] = values[first:]
-
-            self._write_index = (self._write_index + count) % self._capacity
-            self._size += count
-            return count, discarded
-
-    def discard_oldest(self, sample_count: int) -> int:
-        """Discard a bounded amount of old audio for elastic clock-drift control."""
-
-        if sample_count <= 0:
-            return 0
-        with self._lock:
-            discarded = min(int(sample_count), self._size)
-            self._read_index = (self._read_index + discarded) % self._capacity
-            self._size -= discarded
-            return discarded
-
-    def read_into(self, destination: np.ndarray) -> int:
-        """Read into a caller-owned 1-D destination and zero-fill any shortfall."""
-
-        if destination.ndim != 1:
-            raise ValueError("destination must be a one-dimensional PCM view.")
-
-        with self._lock:
-            destination.fill(0)
-            count = min(int(destination.size), self._size)
-            if count == 0:
-                return 0
-
-            first = min(count, self._capacity - self._read_index)
-            destination[:first] = self._storage[self._read_index : self._read_index + first]
-            remaining = count - first
-            if remaining:
-                destination[first:count] = self._storage[:remaining]
-
-            self._read_index = (self._read_index + count) % self._capacity
-            self._size -= count
-            return count
-
-
-def peak_dbfs(samples: np.ndarray) -> float:
-    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
-    return 20.0 * np.log10(peak + 1e-12)
+    def snapshot(self) -> AudioHealthSnapshot:
+        return AudioHealthSnapshot(
+            callbacks=self.callbacks,
+            frames=self.frames,
+            input_overflows=self.input_overflows,
+            input_underflows=self.input_underflows,
+            output_overflows=self.output_overflows,
+            output_underflows=self.output_underflows,
+            callback_errors=self.callback_errors,
+            oversized_callbacks=self.oversized_callbacks,
+            clipped_input_callbacks=self.clipped_input_callbacks,
+        )
 
 
 class LookaheadLimiter:
-    """Peak limiter with a short lookahead and release smoothing."""
+    """Sample-accurate lookahead peak limiter independent of callback boundaries."""
 
     def __init__(
         self,
-        threshold_db: float,
+        controls: AudioControls,
         release_ms: float,
         lookahead_ms: float,
         sample_rate: int,
-        block_size: int,
+        max_callback_frames: int = DEFAULT_MAX_CALLBACK_FRAMES,
     ) -> None:
-        self._threshold_lock = threading.Lock()
-        self._threshold_db = float(threshold_db)
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be greater than zero.")
+        if release_ms < 0 or lookahead_ms < 0:
+            raise ValueError("release_ms and lookahead_ms cannot be negative.")
+        if max_callback_frames <= 0:
+            raise ValueError("max_callback_frames must be greater than zero.")
+
+        self.controls = controls
         self.release_ms = float(release_ms)
         self.lookahead_ms = float(lookahead_ms)
         self.sample_rate = int(sample_rate)
-        self.block_size = int(block_size)
-        self.segment_size = max(1, int(round(self.sample_rate * 0.001)))
-        self.segment_seconds = self.segment_size / float(self.sample_rate)
-        self.lookahead_segments = max(
-            1,
-            math.ceil(self.lookahead_ms / (self.segment_seconds * 1000.0)),
+        self.max_callback_frames = int(max_callback_frames)
+        self.lookahead_samples = max(
+            0,
+            int(round(self.sample_rate * self.lookahead_ms / 1000.0)),
         )
 
-        if self.release_ms <= 0:
-            self.release_coeff = 0.0
+        if self.release_ms == 0:
+            self._release_coefficient = 0.0
         else:
-            self.release_coeff = math.exp(-self.segment_seconds / (self.release_ms / 1000.0))
+            self._release_coefficient = math.exp(
+                -1.0 / (self.sample_rate * self.release_ms / 1000.0)
+            )
 
-        self.pending_segments: deque[np.ndarray] = deque()
-        self.pending_peaks: deque[float] = deque()
-        self.current_gain_db = 0.0
+        workspace_size = self.lookahead_samples + self.max_callback_frames
+        self._signal_history = np.zeros(self.lookahead_samples, dtype=np.float32)
+        self._absolute_history = np.zeros(self.lookahead_samples, dtype=np.float32)
+        self._signal_workspace = np.zeros(workspace_size, dtype=np.float32)
+        self._absolute_workspace = np.zeros(workspace_size, dtype=np.float32)
+        self._window_peaks = np.zeros(self.max_callback_frames, dtype=np.float32)
+        self._gain_workspace = np.ones(self.max_callback_frames, dtype=np.float32)
+        self._current_gain = 1.0
+        self._mute_gain = 0.0 if controls.muted else 1.0
+        self._mute_step = 1.0 / max(
+            1,
+            int(round(self.sample_rate * MUTE_RAMP_MS / 1000.0)),
+        )
+        self.last_input_peak = 0.0
 
-    def get_threshold_db(self) -> float:
-        with self._threshold_lock:
-            return float(self._threshold_db)
+    def process_into(
+        self,
+        source: np.ndarray,
+        destination: np.ndarray,
+        muted: bool,
+    ) -> None:
+        frames = int(source.shape[0])
+        if frames != int(destination.shape[0]):
+            raise ValueError("source and destination must have the same frame count.")
+        if frames > self.max_callback_frames:
+            raise ValueError(
+                f"Callback supplied {frames} frames; capacity is {self.max_callback_frames}."
+            )
+        if frames == 0:
+            return
 
-    def set_threshold_db(self, threshold_db: float) -> float:
-        with self._threshold_lock:
-            self._threshold_db = float(threshold_db)
-            return self._threshold_db
+        lookahead = self.lookahead_samples
+        signal = self._signal_workspace[: lookahead + frames]
+        absolute = self._absolute_workspace[: lookahead + frames]
+        if lookahead:
+            np.copyto(signal[:lookahead], self._signal_history)
+            np.copyto(absolute[:lookahead], self._absolute_history)
 
-    def adjust_threshold_db(self, delta_db: float) -> float:
-        with self._threshold_lock:
-            self._threshold_db = float(self._threshold_db + float(delta_db))
-            return self._threshold_db
-
-    def _target_gain_db(self, peak_db: float, threshold_db: float) -> float:
-        if peak_db <= threshold_db:
-            return 0.0
-        return threshold_db - peak_db
-
-    def process(self, in_block: np.ndarray, muted: bool) -> np.ndarray:
-        block = np.asarray(in_block, dtype=np.float32)
-        if block.size == 0:
-            return np.zeros_like(block)
-
+        current_signal = signal[lookahead:]
+        np.copyto(current_signal, source, casting="unsafe")
+        np.nan_to_num(current_signal, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
         if muted:
-            self.pending_segments.clear()
-            self.pending_peaks.clear()
-            self.current_gain_db = 0.0
-            return np.zeros_like(block)
+            current_signal.fill(0.0)
 
-        # Read the control value once per callback rather than taking a lock
-        # once for every 1 ms lookahead segment.
-        threshold_db = self.get_threshold_db()
-        output = np.empty_like(block)
-        output_offset = 0
-        offset = 0
-        total = int(block.shape[0])
+        current_absolute = absolute[lookahead:]
+        np.abs(current_signal, out=current_absolute)
+        self.last_input_peak = float(np.max(current_absolute))
 
-        while offset < total:
-            end = min(total, offset + self.segment_size)
-            segment = block[offset:end]
-            segment_size = end - offset
-            offset = end
+        windows = np.lib.stride_tricks.sliding_window_view(
+            absolute,
+            lookahead + 1,
+        )
+        peaks = self._window_peaks[:frames]
+        np.max(windows, axis=1, out=peaks)
 
-            self.pending_segments.append(segment.copy())
-            self.pending_peaks.append(peak_dbfs(segment))
+        threshold_linear = 10.0 ** (float(self.controls.threshold_db) / 20.0)
+        release = self._release_coefficient
+        current_gain = self._current_gain
+        mute_gain = self._mute_gain
+        mute_target = 0.0 if muted else 1.0
+        mute_step = self._mute_step
+        gains = self._gain_workspace[:frames]
 
-            if len(self.pending_segments) <= self.lookahead_segments:
-                output[output_offset : output_offset + segment_size] = 0.0
-                output_offset += segment_size
-                continue
-
-            window_peak_db = max(self.pending_peaks)
-            target_gain_db = self._target_gain_db(window_peak_db, threshold_db)
-
-            if target_gain_db < self.current_gain_db:
-                self.current_gain_db = target_gain_db
+        for index in range(frames):
+            peak = float(peaks[index])
+            target_gain = 1.0 if peak <= threshold_linear else threshold_linear / peak
+            if target_gain < current_gain:
+                current_gain = target_gain
             else:
-                self.current_gain_db = (
-                    self.release_coeff * self.current_gain_db
-                    + (1.0 - self.release_coeff) * target_gain_db
-                )
+                current_gain = release * current_gain + (1.0 - release) * target_gain
 
-            out_segment = self.pending_segments.popleft()
-            self.pending_peaks.popleft()
-            gain = 10.0 ** (self.current_gain_db / 20.0)
+            if mute_gain < mute_target:
+                mute_gain = min(mute_target, mute_gain + mute_step)
+            elif mute_gain > mute_target:
+                mute_gain = max(mute_target, mute_gain - mute_step)
+            gains[index] = current_gain * mute_gain
 
-            copy_count = min(segment_size, int(out_segment.size))
-            output[output_offset : output_offset + copy_count] = out_segment[:copy_count] * gain
-            if copy_count < segment_size:
-                output[output_offset + copy_count : output_offset + segment_size] = 0.0
-            output_offset += segment_size
+        self._current_gain = current_gain
+        self._mute_gain = mute_gain
+        np.multiply(signal[:frames], gains, out=destination)
 
-        return output
+        if lookahead:
+            np.copyto(self._signal_history, signal[frames : frames + lookahead])
+            np.copyto(self._absolute_history, absolute[frames : frames + lookahead])
 
 
 class AudioEngine:
-    """Own limiter state and callbacks for the input/output stream pair."""
+    """Own the limiter and the single full-duplex PortAudio callback."""
 
     def __init__(
         self,
         limiter: LookaheadLimiter,
-        mute_event: threading.Event,
+        controls: AudioControls,
+        input_channel: int,
         output_channels: int,
-        buffer_capacity_samples: int,
     ) -> None:
+        if input_channel < 0:
+            raise ValueError("input_channel cannot be negative.")
         if output_channels <= 0:
             raise ValueError("output_channels must be greater than zero.")
         self.limiter = limiter
-        self.mute_event = mute_event
+        self.controls = controls
+        self.input_channel = int(input_channel)
         self.output_channels = int(output_channels)
-        self.buffer = PcmRingBuffer(buffer_capacity_samples)
         self.health = AudioHealth()
-        self._output_was_muted = False
 
-    def input_callback(self, indata, frames, time_info, status) -> None:
-        self.health.report_callback_status("input", status)
+    def callback(self, indata, outdata, frames, time_info, status) -> None:
+        self.health.callbacks += 1
+        self.health.frames += int(frames)
+        self.health.report_status(status)
 
-        muted = self.mute_event.is_set()
-        incoming = np.asarray(indata[:, 0], dtype=np.float32) / 32768.0
-        processed = self.limiter.process(incoming, muted)
-        pcm = np.clip(np.rint(processed * 32767.0), -32768, 32767).astype(np.int16)
+        try:
+            if frames > self.limiter.max_callback_frames:
+                self.health.oversized_callbacks += 1
+                outdata.fill(0.0)
+                return
+            if self.input_channel >= indata.shape[1]:
+                raise RuntimeError(
+                    f"Configured input channel {self.input_channel} is unavailable; "
+                    f"stream supplied {indata.shape[1]} channels."
+                )
 
-        if muted:
-            self.buffer.clear()
-        _, dropped_samples = self.buffer.write(pcm)
-        self.health.report_dropped_samples(dropped_samples)
+            raw_input = indata[:, self.input_channel]
+            processed_output = outdata[:, 0]
+            self.limiter.process_into(
+                raw_input,
+                processed_output,
+                bool(self.controls.muted),
+            )
+            if self.limiter.last_input_peak >= 0.999:
+                self.health.clipped_input_callbacks += 1
+            if outdata.shape[1] > 1:
+                outdata[:, 1:] = processed_output[:, None]
 
-    def output_callback(self, outdata, frames, time_info, status) -> None:
-        self.health.report_callback_status("output", status)
-
-        if self.mute_event.is_set():
-            self.buffer.clear()
-            self._output_was_muted = True
-            outdata.fill(0)
-            return
-
-        if self._output_was_muted:
-            self.buffer.clear()
-            self._output_was_muted = False
-
-        mono_output = outdata[:, 0]
-        read_samples = self.buffer.read_into(mono_output)
-        self.health.report_buffer_underflow(mono_output.size - read_samples)
-        if outdata.shape[1] > 1:
-            outdata[:, 1:] = mono_output[:, None]
+        except BaseException as exc:
+            outdata.fill(0.0)
+            self.health.callback_errors += 1
+            self.health.last_error = exc

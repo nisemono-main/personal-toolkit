@@ -1,4 +1,4 @@
-"""Interactive device and limiter setup for Loud Gate."""
+"""Interactive selection of a validated full-duplex device pair."""
 
 from __future__ import annotations
 
@@ -11,54 +11,7 @@ from .config import (
     LoudGateConfig,
     default_config,
 )
-from .devices import (
-    compatible_device,
-    hostapi_name,
-    list_devices,
-    looks_like_virtual_output,
-    relevant_physical_mic_inputs,
-    relevant_virtual_cable_outputs,
-)
-
-
-def print_device_candidates(title: str, candidates: list[tuple[int, dict]]) -> None:
-    print(f"\n{title}\n")
-    for i, (idx, device) in enumerate(candidates):
-        direction = "input" if device["max_input_channels"] > 0 else "output"
-        print(f"  [{idx}] {device['name']}  ({hostapi_name(device)}; {direction}; menu {i})")
-    print()
-
-
-def pick_device(prompt: str, devices: list[tuple[int, dict]], want_input: bool) -> int:
-    if not devices:
-        raise RuntimeError("No matching devices were found.")
-
-    while True:
-        default_hint = f" [default: {devices[0][0]}]" if len(devices) == 1 else ""
-        raw = input(f"{prompt}{default_hint}: ").strip()
-        if raw == "" and len(devices) == 1:
-            idx, device = devices[0]
-            print(f"Selected: {device['name']}  ({hostapi_name(device)})")
-            return idx
-        if not raw.isdigit():
-            print("Please enter a device index or menu number from the list above.")
-            continue
-        choice = int(raw)
-
-        for original_index, device in devices:
-            if original_index == choice:
-                return original_index
-
-        if 0 <= choice < len(devices):
-            original_index, device = devices[choice]
-        else:
-            print("Out of range, try again.")
-            continue
-
-        if not compatible_device(device, want_input):
-            print("That device does not have the right channels. Pick another one.")
-            continue
-        return original_index
+from .devices import DevicePair, list_devices, relevant_device_pairs
 
 
 def ask_float(
@@ -89,51 +42,67 @@ def ask_float(
         return value
 
 
+def pick_pair(pairs: list[DevicePair], devices: list[dict]) -> DevicePair:
+    if not pairs:
+        raise RuntimeError(
+            "No same-backend microphone/VB-CABLE pair could be opened. "
+            "Install or enable matching WASAPI endpoints, then run setup again."
+        )
+
+    print("\nValidated full-duplex microphone routes:\n")
+    for menu_index, pair in enumerate(pairs):
+        print(
+            f"  [{menu_index}] {devices[pair.input_index]['name']} -> "
+            f"{devices[pair.output_index]['name']}  "
+            f"({pair.hostapi}; {pair.sample_rate} Hz; device indexes "
+            f"{pair.input_index}/{pair.output_index})"
+        )
+    print()
+
+    while True:
+        raw = input("Select a route [0]: ").strip()
+        if raw == "":
+            return pairs[0]
+        if raw.isdigit() and 0 <= int(raw) < len(pairs):
+            return pairs[int(raw)]
+        print("Enter a route number from the list above.")
+
+
+def pick_input_channel(channel_count: int, default: int) -> int:
+    if channel_count == 1:
+        return 0
+    default = default if 0 <= default < channel_count else 0
+    while True:
+        raw = input(
+            f"Input channel [default: {default}; available: 0-{channel_count - 1}]: "
+        ).strip()
+        if raw == "":
+            return default
+        if raw.isdigit() and 0 <= int(raw) < channel_count:
+            return int(raw)
+        print(f"Enter a channel from 0 to {channel_count - 1}.")
+
+
 def interactive_setup(existing: LoudGateConfig | None = None) -> LoudGateConfig:
     cfg = existing if existing is not None else default_config()
-
     devices = list_devices()
-    mic_candidates = relevant_physical_mic_inputs(devices)
-    virtual_out_candidates = relevant_virtual_cable_outputs(devices)
+    pair = pick_pair(relevant_device_pairs(devices), devices)
 
-    print_device_candidates("Physical microphone inputs:", mic_candidates)
-    print_device_candidates("Virtual cable playback outputs:", virtual_out_candidates)
     print(
-        "Pick the real microphone as the input.\n"
-        "Pick the VB-Cable playback/output side below. Windows apps use the matching capture side as the mic source.\n"
+        "\nThe selected route was opened as one full-duplex stream. "
+        "Applications should use CABLE Output as their microphone.\n"
     )
-
-    in_idx = pick_device("Enter the device index of your REAL microphone", mic_candidates, want_input=True)
-    if not virtual_out_candidates:
-        raise RuntimeError(
-            "No VB-Cable playback/output devices were found. Make sure the device you want is exposed as "
-            "a render/output endpoint such as CABLE Input."
-        )
-
-    out_idx = pick_device(
-        "Enter the device index of your VB-CABLE playback/output device",
-        virtual_out_candidates,
-        want_input=False,
-    )
-
-    out_name = devices[out_idx]["name"]
-    if not looks_like_virtual_output(out_name):
-        print(
-            "\nWarning: the selected output does not look like a VB-Cable playback endpoint.\n"
-            f"Selected: {out_name}\n"
-            "The script should write to CABLE Input / playback, and apps should use CABLE Output / recording as the mic.\n"
-        )
-        confirm = input("Continue with this output anyway? [y/N]: ").strip().lower()
-        if confirm not in ("y", "yes"):
-            raise SystemExit("Setup cancelled.")
+    input_channel = pick_input_channel(pair.input_channels, cfg.input_channel)
 
     cfg.version = CONFIG_VERSION
-    cfg.input_device_index = in_idx
-    cfg.input_device_name = devices[in_idx]["name"]
-    cfg.input_device_hostapi = hostapi_name(devices[in_idx])
-    cfg.output_device_index = out_idx
-    cfg.output_device_name = devices[out_idx]["name"]
-    cfg.output_device_hostapi = hostapi_name(devices[out_idx])
+    cfg.input_device_index = pair.input_index
+    cfg.input_device_name = str(devices[pair.input_index]["name"])
+    cfg.input_device_hostapi = pair.hostapi
+    cfg.input_channel = input_channel
+    cfg.output_device_index = pair.output_index
+    cfg.output_device_name = str(devices[pair.output_index]["name"])
+    cfg.output_device_hostapi = pair.hostapi
+    cfg.sample_rate = pair.sample_rate
     cfg.threshold_db = ask_float(
         "Ceiling / threshold in dBFS",
         float(cfg.threshold_db),
@@ -141,5 +110,10 @@ def interactive_setup(existing: LoudGateConfig | None = None) -> LoudGateConfig:
         maximum=MAX_THRESHOLD_DB,
     )
     cfg.release_ms = ask_float("Release time in ms", float(cfg.release_ms), minimum=0.0)
+    cfg.lookahead_ms = ask_float(
+        "Lookahead time in ms",
+        float(cfg.lookahead_ms),
+        minimum=0.0,
+    )
     cfg.validate(require_devices=True)
     return cfg

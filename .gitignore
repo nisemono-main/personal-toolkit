@@ -17,3 +17,10 @@
 Thumbs.db
 *.user
 *.suo
+
+# Loud Gate local diagnostics and test material
+microphone-loud-gate/diagnostics/
+microphone-loud-gate/tests/
+microphone-loud-gate/**/*_test.py
+microphone-loud-gate/**/test_*.py
+microphone-loud-gate/**/diagnostic-*.wav
