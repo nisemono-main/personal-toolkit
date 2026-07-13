@@ -1,16 +1,10 @@
 Option Explicit
 
 ' Usage:
-'   wscript.exe launcher.vbs steam
-'   wscript.exe launcher.vbs losslessscaling
-'   wscript.exe launcher.vbs spotify
-'   wscript.exe launcher.vbs wcap
-'   wscript.exe launcher.vbs vivaldi
-'   wscript.exe launcher.vbs game
-'   wscript.exe launcher.vbs default
+'   wscript.exe launcher.vbs <profile>
 '   wscript.exe launcher.vbs explorer "C:\random path\RandomFolder"
 '
-' Add or edit entries in launcher.ini as needed.
+' Profiles are declared as [profile:<name>] sections in launcher.ini.
 
 Const PROFILE_KIND_EXE = "exe"
 Const PROFILE_KIND_URI = "uri"
@@ -26,7 +20,7 @@ Set config = LoadConfig(fso.BuildPath(scriptFolder, "launcher.ini"))
 Set profiles = BuildProfiles()
 
 If WScript.Arguments.Count = 0 Then
-    Fail 1, "Missing profile. Use: steam, losslessscaling, spotify, wcap, vivaldi, game, default, or explorer <folder>"
+    Fail 1, "Missing profile. Available profiles: " & ListProfiles(profiles) & ". Append a folder path when using a dynamic-folder profile."
 End If
 
 Dim profileName
@@ -39,69 +33,89 @@ End If
 RunProfile profiles(profileName)
 
 Function BuildProfiles()
-    Dim result
+    Dim result, sectionName, profileName, profileSection, kind, target, args
     Set result = CreateObject("Scripting.Dictionary")
     result.CompareMode = 1
 
-    AddConfiguredExeProfile result, "steam", "steam_exe"
-    AddUriProfile result, "losslessscaling", ConfigValue("losslessscaling_uri")
-    AddConfiguredExeProfile result, "spotify", "spotify_exe"
-    AddConfiguredExeProfile result, "wcap", "wcap_exe"
-    AddConfiguredExeProfileWithArgs result, "vivaldi", "vivaldi_exe", "vivaldi_args"
+    For Each sectionName In config.Keys
+        If Left(LCase(sectionName), 8) = "profile:" Then
+            profileName = Trim(Mid(sectionName, 9))
+            Set profileSection = config(sectionName)
+            kind = SectionValue(profileSection, "kind", vbNullString)
+            target = SectionValue(profileSection, "target", vbNullString)
+            args = SectionValue(profileSection, "args", vbNullString)
 
-    AddConfiguredScriptProfile result, "game", "game_profile_vbs"
-    AddConfiguredScriptProfile result, "default", "default_profile_vbs"
+            If Len(profileName) = 0 Then
+                Fail 1, "A profile section is missing its name: [" & sectionName & "]."
+            End If
+            If Len(Trim(kind)) = 0 Then
+                Fail 1, "Profile '" & profileName & "' is missing its kind."
+            End If
 
-    ' Dynamic folder profile: the remaining arguments form the folder path.
-    AddDynamicFolderProfile result, "explorer"
+            Select Case LCase(Trim(kind))
+                Case PROFILE_KIND_EXE, PROFILE_KIND_URI, PROFILE_KIND_SCRIPT, PROFILE_KIND_FOLDER, PROFILE_KIND_DYNAMIC_FOLDER
+                    result.Add LCase(profileName), CreateProfile(profileName, kind, target, args)
+                Case Else
+                    Fail 1, "Profile '" & profileName & "' has unsupported kind '" & kind & "'."
+            End Select
+        End If
+    Next
+
+    If result.Count = 0 Then
+        Fail 1, "No [profile:<name>] sections were found in launcher.ini."
+    End If
 
     Set BuildProfiles = result
 End Function
 
-Sub AddConfiguredExeProfile(profiles, name, key)
-    Dim target
-    target = ConfigValue(key)
-    If Len(Trim(target)) > 0 Then AddExeProfile profiles, name, target
-End Sub
-
-Sub AddConfiguredExeProfileWithArgs(profiles, name, pathKey, argsKey)
-    Dim target
-    target = ConfigValue(pathKey)
-    If Len(Trim(target)) > 0 Then AddExeProfileWithArgs profiles, name, target, ConfigValue(argsKey)
-End Sub
-
-Sub AddConfiguredScriptProfile(profiles, name, key)
-    Dim target
-    target = ConfigValue(key)
-    If Len(Trim(target)) > 0 Then AddScriptProfile profiles, name, target
-End Sub
-
-Function ConfigValue(key)
-    If config.Exists(LCase(Trim(key))) Then
-        ConfigValue = config(LCase(Trim(key)))
+Function SectionValue(section, key, defaultValue)
+    key = LCase(Trim(key))
+    If section.Exists(key) Then
+        SectionValue = section(key)
     Else
-        ConfigValue = vbNullString
+        SectionValue = defaultValue
     End If
 End Function
 
+Function GlobalConfigValue(key)
+    GlobalConfigValue = SectionValue(config("global"), key, vbNullString)
+End Function
+
 Function LoadConfig(configPath)
-    Dim result, file, line, separator, key, value
+    Dim result, currentSection, file, line, separator, key, value, sectionName
     If Not fso.FileExists(configPath) Then
         Fail 1, "Missing local configuration: " & configPath & ". Create launcher.ini using launcher.example.ini as the layout reference, then set the values for this computer."
     End If
 
     Set result = CreateObject("Scripting.Dictionary")
     result.CompareMode = 1
+    Set currentSection = CreateObject("Scripting.Dictionary")
+    currentSection.CompareMode = 1
+    result.Add "global", currentSection
     Set file = fso.OpenTextFile(configPath, 1, False)
 
     Do Until file.AtEndOfStream
         line = Trim(file.ReadLine)
         If Len(line) > 0 And Left(line, 1) <> ";" And Left(line, 1) <> "#" Then
-            separator = InStr(line, "=")
-            If separator > 1 Then
-                key = LCase(Trim(Left(line, separator - 1)))
-                value = Trim(Mid(line, separator + 1))
-                If Len(key) > 0 Then result(key) = value
+            If Left(line, 1) = "[" And Right(line, 1) = "]" Then
+                sectionName = LCase(Trim(Mid(line, 2, Len(line) - 2)))
+                If Len(sectionName) = 0 Then
+                    Fail 1, "Empty section name in " & configPath & "."
+                End If
+                If Not result.Exists(sectionName) Then
+                    Set currentSection = CreateObject("Scripting.Dictionary")
+                    currentSection.CompareMode = 1
+                    result.Add sectionName, currentSection
+                Else
+                    Set currentSection = result(sectionName)
+                End If
+            Else
+                separator = InStr(line, "=")
+                If separator > 1 Then
+                    key = LCase(Trim(Left(line, separator - 1)))
+                    value = Trim(Mid(line, separator + 1))
+                    If Len(key) > 0 Then currentSection(key) = value
+                End If
             End If
         End If
     Loop
@@ -122,7 +136,7 @@ Sub RunProfile(profile)
             OpenFolder profile("target")
         Case PROFILE_KIND_DYNAMIC_FOLDER
             If WScript.Arguments.Count < 2 Then
-                Fail 1, "Missing folder path for explorer."
+                Fail 1, "Missing folder path for " & profile("name") & "."
             End If
             OpenFolder JoinArguments(1)
         Case Else
@@ -130,37 +144,10 @@ Sub RunProfile(profile)
     End Select
 End Sub
 
-Sub AddExeProfile(profiles, name, exePath)
-    AddExeProfileWithArgs profiles, name, exePath, vbNullString
-End Sub
-
-Sub AddExeProfileWithArgs(profiles, name, exePath, args)
-    profiles.Add LCase(Trim(name)), CreateProfile(PROFILE_KIND_EXE, exePath, args)
-End Sub
-
-Sub AddUriProfile(profiles, name, uri)
-    profiles.Add LCase(Trim(name)), CreateProfile(PROFILE_KIND_URI, uri, vbNullString)
-End Sub
-
-Sub AddScriptProfile(profiles, name, scriptPath)
-    AddScriptProfileWithArgs profiles, name, scriptPath, vbNullString
-End Sub
-
-Sub AddScriptProfileWithArgs(profiles, name, scriptPath, args)
-    profiles.Add LCase(Trim(name)), CreateProfile(PROFILE_KIND_SCRIPT, scriptPath, args)
-End Sub
-
-Sub AddFolderProfile(profiles, name, folderPath)
-    profiles.Add LCase(Trim(name)), CreateProfile(PROFILE_KIND_FOLDER, folderPath, vbNullString)
-End Sub
-
-Sub AddDynamicFolderProfile(profiles, name)
-    profiles.Add LCase(Trim(name)), CreateProfile(PROFILE_KIND_DYNAMIC_FOLDER, vbNullString, vbNullString)
-End Sub
-
-Function CreateProfile(kind, target, args)
+Function CreateProfile(name, kind, target, args)
     Dim profile
     Set profile = CreateObject("Scripting.Dictionary")
+    profile.Add "name", name
     profile.Add "kind", kind
     profile.Add "target", target
     profile.Add "args", args
@@ -200,7 +187,7 @@ Sub LaunchScript(scriptPath, args)
         shell.CurrentDirectory = workingDir
     End If
 
-    scriptHostPath = ResolvePath(ConfigValue("script_host_exe"))
+    scriptHostPath = ResolvePath(GlobalConfigValue("script_host_exe"))
     If Not fso.FileExists(scriptHostPath) Then
         Fail 2, "File not found: " & scriptHostPath
     End If
@@ -216,7 +203,10 @@ Sub OpenFolder(folderPath)
         Fail 3, "Folder not found: " & resolvedPath
     End If
 
-    explorerPath = shell.ExpandEnvironmentStrings("%SystemRoot%\explorer.exe")
+    explorerPath = ResolvePath(GlobalConfigValue("explorer_exe"))
+    If Not fso.FileExists(explorerPath) Then
+        Fail 2, "File not found: " & explorerPath
+    End If
     shell.Run BuildCommand(explorerPath, Quote(resolvedPath)), 1, False
 End Sub
 
