@@ -1,10 +1,28 @@
 # Loud Gate
 
-Loud Gate is a Windows microphone router with a sample-accurate lookahead peak limiter. It opens the physical microphone and virtual-audio output as one full-duplex stream, limits sudden peaks, exposes configurable global hotkeys, and can run continuously through a logon scheduled task.
+Loud Gate routes one physical microphone through a sample-accurate lookahead limiter into VB-CABLE, with configurable global hotkeys and optional Windows-startup integration.
 
-## Setup
+## Support boundary
 
-Use Python 3.11 or newer on Windows:
+Loud Gate is Windows-only and currently supports and checks **Windows WASAPI** device pairs only.
+
+- Setup shows only WASAPI microphone inputs and WASAPI `CABLE Input` playback endpoints.
+- The exact input/output pair is opened before it can be selected.
+- WDM-KS, DirectSound, MME, ASIO, and other backends are not tested by this project. Using them is at your own risk.
+- If the VB-Audio endpoint is missing, setup and runtime log a warning instead of silently selecting another audio route.
+
+## Requirements
+
+- Windows
+- Python 3.11 or newer
+- [VB-CABLE](https://vb-audio.com/Cable/) from VB-Audio
+- A physical microphone exposed through Windows WASAPI
+
+Install VB-CABLE, then use `CABLE Input (VB-Audio Virtual Cable)` as Loud Gate's output. Applications that should receive the processed microphone must use `CABLE Output (VB-Audio Virtual Cable)` as their microphone input.
+
+## Quick start
+
+From this directory:
 
 ```powershell
 py -m venv .venv
@@ -12,35 +30,54 @@ py -m venv .venv
 .\.venv\Scripts\python.exe .\loud_gate.py
 ```
 
-The first interactive run finds microphone/VB-CABLE pairs that PortAudio can open together through the same Windows audio backend. WASAPI is preferred. It stores the selected route in `%APPDATA%\loud-gate\config.ini`; device indexes are refreshed from the saved names and backend when Windows renumbers them. The program reads that exact file at startup, while `config.example.ini` beside the script is only a layout reference. Use `--run` for a non-interactive start, `--setup` to select devices again, and `--install-startup` or `--uninstall-startup` to manage the scheduled task.
+The first run performs interactive setup. It lists only validated WASAPI microphone-to-VB-CABLE pairs and saves the selection to:
 
-## Audio assumptions
+```text
+%APPDATA%\loud-gate\config.ini
+```
 
-Loud Gate is designed for Windows audio routing through the standard **VB-CABLE** driver. Download it from the official [VB-Audio Virtual Cables page](https://vb-audio.com/Cable/), install the Windows package, and select the normal `CABLE Input (VB-Audio Virtual Cable)` playback endpoint as Loud Gate's output. Applications that should receive the processed microphone should use the matching `CABLE Output (VB-Audio Virtual Cable)` recording endpoint as their microphone.
+Use these commands afterwards:
 
-The default sample-rate assumption is **44,100 Hz**. Setup validates the complete full-duplex route at 44,100 Hz, the endpoint defaults, and 48,000 Hz, then saves the first working rate. For predictable behavior, set the physical microphone, `CABLE Input`, and `CABLE Output` formats to that saved rate in Windows Sound settings. The limiter uses an exact sample delay and remains correct when the audio backend changes callback size.
+```powershell
+# Start without prompting
+.\.venv\Scripts\python.exe .\loud_gate.py --run
 
-The script assumes one physical microphone input and one VB-CABLE playback/output endpoint. It does not create the virtual cable itself, mix multiple microphones, or replace the Windows recording endpoint used by applications. The expected route is:
+# Select a different validated pair
+.\.venv\Scripts\python.exe .\loud_gate.py --setup
+```
+
+`config.example.ini` is a layout reference. It is not loaded automatically and should not be placed beside the script as the live configuration.
+
+## Audio route
 
 ```text
 physical microphone (WASAPI input)
-             |
-             v
-one full-duplex Loud Gate stream -> CABLE Input (WASAPI output)
-                                             |
-                                             v
-                   applications use CABLE Output as microphone
+              │
+              ▼
+one full-duplex Loud Gate stream
+              │
+              ▼
+CABLE Input (WASAPI playback/output)
+              │
+              ▼
+applications use CABLE Output as microphone input
 ```
 
-## Configuration and hotkeys
+For predictable results, set the physical microphone, `CABLE Input`, and `CABLE Output` to the same Windows format. The reference configuration is **44,100 Hz**. Setup validates 44,100 Hz, the endpoint defaults, and 48,000 Hz, then saves the first working rate.
 
-The normal setup path is to create the real configuration by running `loud_gate.py` once and selecting a validated route. If you need to create it manually, create `%APPDATA%\loud-gate\config.ini` with the layout documented in `config.example.ini`; do not place it beside the script because that file is never loaded. Both saved host APIs must describe the same backend. `input_channel` is zero-based, and `sample_rate` must be supported by the complete input/output pair. Changes take effect after restarting Loud Gate.
+Loud Gate assumes one physical microphone and one VB-CABLE route. It does not create VB-CABLE, mix multiple microphones, or replace the recording device selected inside other applications.
+
+## Configuration
+
+The live file is `%APPDATA%\loud-gate\config.ini`. Run `--setup` when changing devices; edit the file directly only when you understand the device names and WASAPI pairing.
+
+The core layout is:
 
 ```ini
 [loud-gate]
 version=6
 input_device_index=17
-input_device_name=Headset Microphone (Maonocaster G1 Neo)
+input_device_name=Your Microphone
 input_device_hostapi=Windows WASAPI
 input_channel=0
 output_device_index=16
@@ -52,7 +89,17 @@ release_ms=150.0
 lookahead_ms=25.0
 ```
 
-Edit the `[hotkeys]` section in the real `%APPDATA%\loud-gate\config.ini` to change the bindings. Every configured combination must be unique and available to Windows. The default layout is:
+Important values:
+
+- `input_channel` is zero-based. Use setup to select the microphone channel.
+- `sample_rate` must be supported by the complete WASAPI pair.
+- `threshold_db` is the limiter ceiling; lower values reduce peaks more strongly.
+- `release_ms` controls how quickly attenuation recovers.
+- `lookahead_ms` allows the limiter to react before a peak reaches the output.
+
+### Hotkeys
+
+Edit the `[hotkeys]` section in the same live INI file. Every combination must be unique and available to Windows:
 
 ```ini
 [hotkeys]
@@ -63,19 +110,19 @@ threshold_up_hotkey=Ctrl+F14
 threshold_step_db=5.0
 ```
 
-Supported key names include `F1`–`F24`, letters, digits, and common names such as `Esc`, `Space`, `Enter`, `Home`, `End`, `Left`, `Right`, `Up`, and `Down`. Use `+` between modifiers and the key. Loud Gate rejects duplicate bindings in its own configuration, and Windows rejects combinations already registered by another application.
+Supported keys include `F1`–`F24`, letters, digits, and names such as `Esc`, `Space`, `Enter`, `Home`, `End`, `Left`, `Right`, `Up`, and `Down`. Use `+` between modifiers and the key. Restart Loud Gate after configuration changes.
 
 ## Windows startup
 
-After the interactive setup, install the logon task:
+After setup, install the logon task:
 
 ```powershell
 .\.venv\Scripts\python.exe .\loud_gate.py --install-startup
 ```
 
-The command creates a scheduled task and generates `%APPDATA%\loud-gate\startup_launcher.vbs`. The VBS launcher uses Windows Script Host so the normal background start does not open a command window; it waits for the hidden Python process and shows a visible error window if startup exits unsuccessfully after its bounded retry period. The original failure and startup phase remain in `%APPDATA%\loud-gate\loud_gate.log`.
+This creates a scheduled task and a generated `%APPDATA%\loud-gate\startup_launcher.vbs`. VBS is used because Windows Script Host can start the background Python process without opening a command window. If the bounded startup attempt fails, it shows a visible error window and records the startup phase and exception in `%APPDATA%\loud-gate\loud_gate.log`.
 
-If the Python executable or repository location changes, run `--install-startup` again to regenerate the launcher with the current paths. If Task Scheduler never launches the task at all, inspect the task's History and Last Run Result because no child process exists to display the popup.
+If the Python or repository path changes, run `--install-startup` again so the launcher is regenerated. If Task Scheduler never starts the launcher, inspect the task's History and Last Run Result.
 
 Remove the task with:
 
@@ -83,6 +130,24 @@ Remove the task with:
 .\.venv\Scripts\python.exe .\loud_gate.py --uninstall-startup
 ```
 
-Python is used because NumPy provides efficient preallocated float32 DSP workspaces and sounddevice exposes PortAudio's full-duplex streams and timing information, while `ctypes` connects the service to Windows global-hotkey APIs. The callback uses one direct input-to-output path without a user-space clock-bridging ring. The generated startup launcher uses Windows Script Host so scheduled startup can remain hidden without opening a console window.
+## Troubleshooting
 
-The program uses only environment-based user data paths and paths derived from its own executable/script location.
+### VB-CABLE is missing
+
+Install the Windows package from the [official VB-Audio Cable page](https://vb-audio.com/Cable/), then confirm that both `CABLE Input` appears under Playback and `CABLE Output` appears under Recording. Re-run `--setup` afterwards.
+
+### No route is listed
+
+The microphone and `CABLE Input` must both be present as Windows WASAPI endpoints and must open together at one sample rate. Check Windows Sound settings, endpoint formats, and whether another application has taken exclusive control. Other backends are outside the tested support boundary.
+
+### The log reports full-scale input
+
+That means the microphone signal is already reaching digital full scale before Loud Gate can limit it. Reduce the physical microphone/interface gain and check Windows enhancements or automatic gain control in the application using `CABLE Output`.
+
+The log file is `%APPDATA%\loud-gate\loud_gate.log`.
+
+## Implementation notes
+
+Python is used because NumPy provides the preallocated float32 DSP workspaces and `sounddevice` exposes PortAudio's WASAPI full-duplex stream. The audio callback processes input directly into output without a user-space clock-bridging queue. `ctypes` provides the Windows global-hotkey and startup integration.
+
+The generated VBS launcher is used for hidden background startup; Python is used for device setup, configuration, hotkeys, and audio processing.

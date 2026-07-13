@@ -9,6 +9,17 @@ import sounddevice as sd
 from .config import DEFAULT_SAMPLE_RATE, LoudGateConfig
 
 
+SUPPORTED_HOSTAPI = "Windows WASAPI"
+VB_CABLE_MISSING_WARNING = (
+    "VB-Audio CABLE Input was not found as a Windows WASAPI output device. "
+    "Install or enable VB-CABLE before starting Loud Gate."
+)
+UNSUPPORTED_HOSTAPI_WARNING = (
+    "Only Windows WASAPI device pairs are supported and checked by Loud Gate. "
+    "WDM-KS, DirectSound, MME, and other backends are untested and are used at your own risk."
+)
+
+
 @dataclass(frozen=True, slots=True)
 class DevicePair:
     """A full-duplex input/output pair proven openable by one PortAudio stream."""
@@ -35,6 +46,10 @@ def hostapi_name(device: dict) -> str:
     if isinstance(hostapi_index, int) and 0 <= hostapi_index < len(apis):
         return str(apis[hostapi_index]["name"])
     return "unknown"
+
+
+def is_supported_hostapi(name: str) -> bool:
+    return normalize_name(name) == normalize_name(SUPPORTED_HOSTAPI)
 
 
 def same_hostapi(input_device: dict, output_device: dict) -> bool:
@@ -137,13 +152,16 @@ def relevant_physical_mic_inputs(devices: list[dict]) -> list[tuple[int, dict]]:
     candidates = [
         (index, device)
         for index, device in enumerate(devices)
-        if compatible_device(device, True) and looks_like_physical_mic(str(device["name"]))
+        if compatible_device(device, True)
+        and is_supported_hostapi(hostapi_name(device))
+        and looks_like_physical_mic(str(device["name"]))
     ]
     if not candidates:
         candidates = [
             (index, device)
             for index, device in enumerate(devices)
             if compatible_device(device, True)
+            and is_supported_hostapi(hostapi_name(device))
         ]
     return sorted(
         _unique_candidates(candidates),
@@ -161,6 +179,7 @@ def relevant_virtual_cable_outputs(devices: list[dict]) -> list[tuple[int, dict]
         (index, device)
         for index, device in enumerate(devices)
         if compatible_device(device, False)
+        and is_supported_hostapi(hostapi_name(device))
         and looks_like_virtual_cable_output(str(device["name"]))
     ]
     return sorted(
@@ -230,7 +249,10 @@ def resolve_pair_format(
 ) -> DevicePair | None:
     input_device = devices[input_index]
     output_device = devices[output_index]
-    if not same_hostapi(input_device, output_device):
+    if (
+        not same_hostapi(input_device, output_device)
+        or not is_supported_hostapi(hostapi_name(input_device))
+    ):
         return None
 
     input_channels = stream_channels(input_device, True)
@@ -258,7 +280,10 @@ def relevant_device_pairs(devices: list[dict]) -> list[DevicePair]:
     pairs: list[DevicePair] = []
     for input_index, input_device in relevant_physical_mic_inputs(devices):
         for output_index, output_device in relevant_virtual_cable_outputs(devices):
-            if not same_hostapi(input_device, output_device):
+            if (
+                not same_hostapi(input_device, output_device)
+                or not is_supported_hostapi(hostapi_name(input_device))
+            ):
                 continue
             pair = resolve_pair_format(devices, input_index, output_index)
             if pair is not None:
@@ -290,6 +315,8 @@ def _stored_device_candidates(
     candidates: list[int] = []
     for index, device in enumerate(devices):
         if not compatible_device(device, want_input):
+            continue
+        if not is_supported_hostapi(hostapi_name(device)):
             continue
         candidate_name = normalize_name(str(device["name"]))
         if candidate_name != normalized_name and normalized_name not in candidate_name:

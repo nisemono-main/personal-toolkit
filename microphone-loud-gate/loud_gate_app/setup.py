@@ -11,7 +11,14 @@ from .config import (
     LoudGateConfig,
     default_config,
 )
-from .devices import DevicePair, list_devices, relevant_device_pairs
+from .devices import (
+    UNSUPPORTED_HOSTAPI_WARNING,
+    VB_CABLE_MISSING_WARNING,
+    DevicePair,
+    list_devices,
+    relevant_device_pairs,
+    relevant_virtual_cable_outputs,
+)
 
 
 def ask_float(
@@ -45,8 +52,8 @@ def ask_float(
 def pick_pair(pairs: list[DevicePair], devices: list[dict]) -> DevicePair:
     if not pairs:
         raise RuntimeError(
-            "No same-backend microphone/VB-CABLE pair could be opened. "
-            "Install or enable matching WASAPI endpoints, then run setup again."
+            "No Windows WASAPI microphone/VB-CABLE pair could be opened. "
+            "Other audio backends are untested and are used at your own risk."
         )
 
     print("\nValidated full-duplex microphone routes:\n")
@@ -86,6 +93,9 @@ def pick_input_channel(channel_count: int, default: int) -> int:
 def interactive_setup(existing: LoudGateConfig | None = None) -> LoudGateConfig:
     cfg = existing if existing is not None else default_config()
     devices = list_devices()
+    if not relevant_virtual_cable_outputs(devices):
+        print(f"\nWARNING: {VB_CABLE_MISSING_WARNING}")
+        print(f"WARNING: {UNSUPPORTED_HOSTAPI_WARNING}\n")
     pair = pick_pair(relevant_device_pairs(devices), devices)
 
     print(

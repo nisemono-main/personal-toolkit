@@ -16,8 +16,11 @@ from ctypes import wintypes
 from .audio_engine import AudioControls, AudioEngine, AudioHealthSnapshot, LookaheadLimiter
 from .config import MAX_THRESHOLD_DB, MIN_THRESHOLD_DB, LoudGateConfig, save_config
 from .devices import (
+    UNSUPPORTED_HOSTAPI_WARNING,
+    VB_CABLE_MISSING_WARNING,
     list_devices,
     looks_like_virtual_output,
+    relevant_virtual_cable_outputs,
     resolve_device_pair,
 )
 
@@ -307,12 +310,16 @@ def run_service(
             startup_attempts += 1
             phase = "device discovery"
             devices = list_devices()
+            if not relevant_virtual_cable_outputs(devices):
+                logger.warning("%s", VB_CABLE_MISSING_WARNING)
+                logger.warning("%s", UNSUPPORTED_HOSTAPI_WARNING)
             phase = "device resolution"
             pair = resolve_device_pair(devices, cfg)
             if pair is None:
                 raise RuntimeError(
-                    "The saved devices could not be opened as one same-backend full-duplex stream. "
-                    "Run loud_gate.py --setup and select a validated route."
+                    "The saved devices could not be opened as one validated Windows WASAPI "
+                    "full-duplex stream. Run loud_gate.py --setup and select a supported route. "
+                    "Other audio backends are untested and are used at your own risk."
                 )
 
             if not 0 <= cfg.input_channel < pair.input_channels:
