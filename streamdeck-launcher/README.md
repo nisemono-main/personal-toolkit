@@ -69,3 +69,17 @@ Create a **System → Open** or equivalent command action for `wscript.exe`, the
 | Open a selected folder | `wscript.exe` | `launcher.vbs explorer "C:\Some\Folder"` |
 
 The `game` and `default` entries use the relative paths in `launcher.ini` to call `Run-GameProfile.vbs` and `Run-DefaultProfileHidden.vbs` from `nvidia-display-profiles`. This keeps the two projects loosely coupled: the launcher owns the button-facing command, while the NVIDIA project owns display changes, monitor handling, elevation, and game selection. The relative paths continue to work after moving the repository as long as both project directories remain siblings.
+
+## OpenDeck example
+
+OpenDeck can bind the launcher through its **Run Command** action. The example below shows a button configured to run the `game` profile when pressed:
+
+![OpenDeck launcher example](opendeck-example.png)
+
+Use the launcher directory on your own machine in the command field. Quote the script path if the directory contains spaces:
+
+```text
+wscript.exe "C:\path\to\streamdeck-launcher\launcher.vbs" game
+```
+
+Replace `game` with any profile name from `launcher.ini`, such as `default`, `steam`, or a profile you added yourself. `wscript.exe` keeps the command quiet by running the VBScript without opening a command prompt, which makes it suitable for OpenDeck button actions.
