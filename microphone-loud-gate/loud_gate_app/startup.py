@@ -7,38 +7,81 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from ctypes import wintypes
 
 from .config import app_dir, ensure_app_dir, log_path
 
 
 TASK_NAME = "LoudGateMicRouter"
 STARTUP_LAUNCHER_NAME = "startup_launcher.vbs"
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+INFINITE = 0xFFFFFFFF
+
+
+class SHELLEXECUTEINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", ctypes.c_ulong),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", ctypes.c_wchar_p),
+        ("lpFile", ctypes.c_wchar_p),
+        ("lpParameters", ctypes.c_wchar_p),
+        ("lpDirectory", ctypes.c_wchar_p),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", ctypes.c_wchar_p),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIcon", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
 
 
 def entrypoint_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
     return Path(__file__).resolve().parents[1] / "loud_gate.py"
 
 
-def is_windows_admin() -> bool:
+def application_command(*extra_args: str) -> list[str]:
+    """Build a command that works from source and from a frozen one-file exe."""
+
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve()), *extra_args]
+    return [sys.executable, str(entrypoint_path()), *extra_args]
+
+
+def _run_elevated(extra_args: list[str]) -> None:
+    """Run one maintenance operation through UAC and wait for its result."""
+
+    command = application_command(*extra_args)
+    executable, *parameters = command
+    info = SHELLEXECUTEINFO()
+    info.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = "runas"
+    info.lpFile = executable
+    info.lpParameters = subprocess.list2cmdline(parameters)
+    info.lpDirectory = str(entrypoint_path().parent)
+    info.nShow = 1
+
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        error = ctypes.WinError()
+        raise RuntimeError(f"Windows could not start the elevated maintenance task: {error}")
+
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+        kernel32.WaitForSingleObject(info.hProcess, INFINITE)
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(exit_code)):
+            raise RuntimeError(f"Windows could not read the elevated task result: {ctypes.WinError()}")
+    finally:
+        kernel32.CloseHandle(info.hProcess)
 
-
-def relaunch_as_admin(extra_args: list[str]) -> None:
-    script = str(entrypoint_path())
-    params = subprocess.list2cmdline([script, *extra_args])
-    rc = ctypes.windll.shell32.ShellExecuteW(
-        None,
-        "runas",
-        sys.executable,
-        params,
-        None,
-        1,
-    )
-    if rc <= 32:
-        raise RuntimeError("Failed to relaunch elevated.")
+    if exit_code.value != 0:
+        raise RuntimeError(f"The elevated maintenance task failed with exit code {exit_code.value}.")
 
 
 def startup_launcher_path() -> Path:
@@ -56,9 +99,9 @@ def write_startup_launcher() -> Path:
 
     ensure_app_dir()
     launcher = startup_launcher_path()
-    python_exe = str(Path(sys.executable).resolve())
-    script = str(entrypoint_path())
-    command = f"{_vbs_literal(python_exe)} {_vbs_literal(script)} --run --quiet"
+    command = subprocess.list2cmdline(
+        application_command("--runtime", "--background", "--autorun")
+    )
     log_file = _vbs_literal(str(log_path()))
     vbs = (
         "On Error Resume Next\n"
@@ -86,7 +129,27 @@ def write_startup_launcher() -> Path:
     return launcher
 
 
-def install_startup_task() -> None:
+def launch_runtime() -> subprocess.Popen:
+    """Start the independent runtime process without inheriting a console window."""
+
+    command = application_command("--runtime", "--background")
+    creation_flags = (
+        getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    )
+    return subprocess.Popen(
+        command,
+        cwd=str(entrypoint_path().parent),
+        creationflags=creation_flags,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def install_startup_task(*, elevated: bool = False) -> None:
     launcher = write_startup_launcher()
     system_root = os.environ.get("SystemRoot")
     if not system_root:
@@ -103,7 +166,7 @@ def install_startup_task() -> None:
             "/SC",
             "ONLOGON",
             "/RL",
-            "HIGHEST",
+            "LIMITED",
             "/F",
             "/TR",
             command,
@@ -113,12 +176,16 @@ def install_startup_task() -> None:
         check=False,
     )
     if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        if not elevated and "access is denied" in message.lower():
+            _run_elevated(["--install-startup", "--elevated"])
+            return
         raise RuntimeError(
-            f"Failed to create startup task: {result.stderr.strip() or result.stdout.strip()}"
+            f"Failed to create startup task: {message}"
         )
 
 
-def uninstall_startup_task() -> None:
+def uninstall_startup_task(*, elevated: bool = False) -> None:
     result = subprocess.run(
         ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
         capture_output=True,
@@ -132,6 +199,9 @@ def uninstall_startup_task() -> None:
                 startup_launcher_path().unlink()
             except FileNotFoundError:
                 pass
+            return
+        if not elevated and "access is denied" in message.lower():
+            _run_elevated(["--uninstall-startup", "--elevated"])
             return
         raise RuntimeError(
             f"Failed to remove startup task: {message or 'unknown error'}"

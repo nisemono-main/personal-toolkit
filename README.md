@@ -9,7 +9,7 @@ A curated collection of small Windows utilities, browser tools, and workflow exp
 | [`nvidia-display-profiles`](./nvidia-display-profiles) | Applies display profiles that switch resolution, refresh rate, brightness, Digital Vibrance, monitor state, and game launch behavior. | PowerShell, Windows APIs, NVIDIA NVAPI |
 | [`chatgpt-userscripts`](./chatgpt-userscripts) | Browser userscripts for ChatGPT queue workflows and crash recovery. | JavaScript, Tampermonkey |
 | [`unity-log-compactor`](./unity-log-compactor) | Compacts verbose Unity exception stacks into readable message-and-source summaries. | PowerShell, VBScript |
-| [`microphone-loud-gate`](./microphone-loud-gate) | Routes and limits microphone audio with a lookahead limiter and configurable global hotkeys. | Python, NumPy, sounddevice |
+| [`microphone-loud-gate`](./microphone-loud-gate) | Configures and independently runs a WASAPI microphone limiter with global hotkeys and a distributable Windows manager. | Python, NumPy, sounddevice, Tk |
 | [`youtube-ad-skipper`](./youtube-ad-skipper) | Chromium extension that detects YouTube ads, mutes playback, and performs trusted skip clicks. | JavaScript, Manifest V3 |
 | [`streamdeck-launcher`](./streamdeck-launcher) | Configurable launcher for applications, URIs, folders, and companion scripts. | VBScript |
 | [`wiztree-tree-formatter`](./wiztree-tree-formatter) | Converts a WizTree CSV export into a readable Markdown tree. | PowerShell |
@@ -28,6 +28,8 @@ Only configuration layouts and safe examples are tracked. Machine-specific value
 | `microphone-loud-gate` | Run the initial setup; it creates `%APPDATA%\loud-gate\config.ini`. | Loud Gate reads and updates the file in `%APPDATA%`; its repository example is documentation only. |
 
 Relative paths in configuration are resolved from the relevant project or launcher directory where practical.
+
+The Loud Gate project also includes a GitHub Actions workflow that builds its single-file `LoudGate.exe` on Windows. Pushing a version tag such as `v1.0.0` creates a GitHub Release with the built executable attached.
 
 ## Safety and scope
 

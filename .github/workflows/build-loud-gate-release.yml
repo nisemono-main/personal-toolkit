@@ -1,0 +1,55 @@
+name: Build Loud Gate
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: microphone-loud-gate/requirements-build.txt
+
+      - name: Install runtime and build dependencies
+        shell: pwsh
+        working-directory: microphone-loud-gate
+        run: python -m pip install --upgrade pip; python -m pip install -r requirements-build.txt
+
+      - name: Build one-file Windows executable
+        shell: pwsh
+        working-directory: microphone-loud-gate
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name LoudGate --hidden-import=loud_gate_app.manager
+          --collect-all sounddevice loud_gate.py
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LoudGate-windows
+          path: microphone-loud-gate/dist/LoudGate.exe
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          "microphone-loud-gate/dist/LoudGate.exe"
+          --title "Loud Gate ${{ github.ref_name }}"
+          --generate-notes

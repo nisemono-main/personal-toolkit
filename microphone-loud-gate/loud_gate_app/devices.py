@@ -174,6 +174,24 @@ def relevant_physical_mic_inputs(devices: list[dict]) -> list[tuple[int, dict]]:
     )
 
 
+def wasapi_input_devices(devices: list[dict]) -> list[tuple[int, dict]]:
+    """Return every usable WASAPI input so the manager does not choose a mic implicitly."""
+
+    candidates = [
+        (index, device)
+        for index, device in enumerate(devices)
+        if compatible_device(device, True) and is_supported_hostapi(hostapi_name(device))
+    ]
+    return sorted(
+        _unique_candidates(candidates),
+        key=lambda item: (
+            _mic_name_rank(item[1]),
+            normalize_name(str(item[1]["name"])),
+            item[0],
+        ),
+    )
+
+
 def relevant_virtual_cable_outputs(devices: list[dict]) -> list[tuple[int, dict]]:
     candidates = [
         (index, device)
@@ -186,6 +204,24 @@ def relevant_virtual_cable_outputs(devices: list[dict]) -> list[tuple[int, dict]
         _unique_candidates(candidates),
         key=lambda item: (
             hostapi_rank(item[1]),
+            normalize_name(str(item[1]["name"])),
+            item[0],
+        ),
+    )
+
+
+def wasapi_output_devices(devices: list[dict]) -> list[tuple[int, dict]]:
+    """Return every usable WASAPI output, with VB-CABLE endpoints listed first."""
+
+    candidates = [
+        (index, device)
+        for index, device in enumerate(devices)
+        if compatible_device(device, False) and is_supported_hostapi(hostapi_name(device))
+    ]
+    return sorted(
+        _unique_candidates(candidates),
+        key=lambda item: (
+            0 if looks_like_virtual_cable_output(str(item[1]["name"])) else 1,
             normalize_name(str(item[1]["name"])),
             item[0],
         ),

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import signal
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import sounddevice as sd
 from ctypes import wintypes
@@ -23,6 +24,7 @@ from .devices import (
     relevant_virtual_cable_outputs,
     resolve_device_pair,
 )
+from .ipc import RuntimeIpcServer
 
 
 STARTUP_RETRY_LIMIT = 3
@@ -112,6 +114,36 @@ HOTKEY_DEFINITIONS = (
     HotkeyDefinition(HOTKEY_ID_THRESHOLD_DOWN, "threshold_down_hotkey", "threshold down"),
     HotkeyDefinition(HOTKEY_ID_THRESHOLD_UP, "threshold_up_hotkey", "threshold up"),
 )
+
+
+class RuntimeStatus:
+    """Thread-safe, low-volume status shared with the manager process."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values: dict[str, Any] = {
+            "state": "starting",
+            "pid": 0,
+            "error": "",
+            "phase": "initialization",
+            "muted": False,
+            "threshold_db": 0.0,
+            "input_device": "",
+            "output_device": "",
+            "hostapi": "",
+            "sample_rate": 0,
+            "cpu_load": 0.0,
+            "latency_ms": None,
+            "last_health": "",
+        }
+
+    def update(self, **values: Any) -> None:
+        with self._lock:
+            self._values.update(values)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._values)
 
 
 def parse_hotkey(value: str, field_name: str) -> tuple[int, int, str]:
@@ -286,8 +318,13 @@ def run_service(
     cfg: LoudGateConfig,
     logger: logging.Logger,
     verbose: bool,
+    *,
+    stop_event: threading.Event | None = None,
+    status: RuntimeStatus | None = None,
+    controls_ref: dict[str, AudioControls | None] | None = None,
 ) -> None:
-    stop_event = threading.Event()
+    stop_event = stop_event or threading.Event()
+    status = status or RuntimeStatus()
     hotkeys = configured_hotkeys(cfg)
     try:
         threshold_step_db = float(cfg.threshold_step_db)
@@ -308,12 +345,21 @@ def run_service(
         phase = "initialization"
         try:
             startup_attempts += 1
+            status.update(
+                state="starting",
+                phase=phase,
+                error="",
+                threshold_db=float(cfg.threshold_db),
+                muted=False,
+            )
             phase = "device discovery"
+            status.update(phase=phase)
             devices = list_devices()
             if not relevant_virtual_cable_outputs(devices):
                 logger.warning("%s", VB_CABLE_MISSING_WARNING)
                 logger.warning("%s", UNSUPPORTED_HOSTAPI_WARNING)
             phase = "device resolution"
+            status.update(phase=phase)
             pair = resolve_device_pair(devices, cfg)
             if pair is None:
                 raise RuntimeError(
@@ -363,7 +409,10 @@ def run_service(
                 )
 
             phase = "stream configuration"
+            status.update(phase=phase)
             controls = AudioControls(threshold_db=float(cfg.threshold_db))
+            if controls_ref is not None:
+                controls_ref["controls"] = controls
             limiter = LookaheadLimiter(
                 controls=controls,
                 release_ms=float(cfg.release_ms),
@@ -382,6 +431,7 @@ def run_service(
                     )
                     return
                 controls.set_threshold_db(new_threshold)
+                status.update(threshold_db=new_threshold)
                 cfg.threshold_db = new_threshold
                 try:
                     save_config(cfg)
@@ -398,6 +448,7 @@ def run_service(
 
             def toggle_mute() -> None:
                 controls.muted = not controls.muted
+                status.update(muted=controls.muted)
                 if not controls.muted:
                     logger.info("%s: mic unmuted", binding_labels["mute"])
                 else:
@@ -419,6 +470,7 @@ def run_service(
             }
 
             phase = "audio and hotkey setup"
+            status.update(phase=phase)
             hotkey = GlobalHotkeyManager(
                 logger,
                 hotkeys,
@@ -433,6 +485,7 @@ def run_service(
             )
 
             phase = "hotkey registration"
+            status.update(phase=phase)
             hotkey.start()
             if stop_event.is_set():
                 break
@@ -460,6 +513,7 @@ def run_service(
                 )
 
             phase = "full-duplex stream startup"
+            status.update(phase=phase)
             with sd.Stream(
                 samplerate=pair.sample_rate,
                 blocksize=0,
@@ -472,6 +526,26 @@ def run_service(
                 startup_complete = True
                 has_started_once = True
                 startup_attempts = 0
+                try:
+                    latency_values = stream.latency
+                    if isinstance(latency_values, (tuple, list)):
+                        latency_ms = max(float(value) for value in latency_values) * 1000.0
+                    else:
+                        latency_ms = float(latency_values) * 1000.0
+                except (TypeError, ValueError):
+                    latency_ms = None
+                status.update(
+                    state="running",
+                    phase="audio health monitoring",
+                    input_device=str(devices[pair.input_index]["name"]),
+                    output_device=str(devices[pair.output_index]["name"]),
+                    hostapi=pair.hostapi,
+                    sample_rate=pair.sample_rate,
+                    latency_ms=latency_ms,
+                    threshold_db=float(controls.threshold_db),
+                    muted=bool(controls.muted),
+                    error="",
+                )
                 logger.info(
                     "Full-duplex audio ready; actual latency=%s seconds, lookahead=%s samples.",
                     stream.latency,
@@ -500,10 +574,13 @@ def run_service(
                         callback_fault_streak = 0
 
                     cpu_load = float(stream.cpu_load)
-                    now = time.monotonic()
-                    has_observations = bool(
-                        incidents.incident_count or incidents.clipped_input_callbacks
+                    status.update(
+                        cpu_load=cpu_load,
+                        threshold_db=float(controls.threshold_db),
+                        muted=bool(controls.muted),
                     )
+                    now = time.monotonic()
+                    has_observations = bool(incidents.incident_count)
                     if has_observations and now - last_health_log >= HEALTH_LOG_INTERVAL_SECONDS:
                         message = _describe_audio_health(incidents)
                         if incidents.callback_errors and audio.health.last_error is not None:
@@ -513,9 +590,11 @@ def run_service(
                             message,
                             cpu_load * 100.0,
                         )
+                        status.update(last_health=message)
                         last_health_log = now
                     elif cpu_load >= 0.8 and now - last_health_log >= HEALTH_LOG_INTERVAL_SECONDS:
                         logger.warning("Audio callback CPU load is high: %.1f%%.", cpu_load * 100.0)
+                        status.update(last_health=f"high callback CPU load ({cpu_load * 100.0:.1f}%)")
                         last_health_log = now
 
                     if callback_fault_streak >= HEALTH_RESTART_STREAK:
@@ -532,6 +611,8 @@ def run_service(
         except Exception as exc:
             if stop_event.is_set():
                 break
+
+            status.update(state="error", phase=phase, error=str(exc))
 
             if startup_complete or has_started_once:
                 logger.exception("Runtime failure during %s: %s", phase, exc)
@@ -555,11 +636,70 @@ def run_service(
                 break
             continue
         finally:
+            if controls_ref is not None:
+                controls_ref["controls"] = None
             if hotkey is not None:
                 try:
                     hotkey.stop()
                 except Exception:
                     logger.exception("Failed to cleanly stop the global hotkey manager.")
+
+    status.update(state="stopped", phase="stopped")
+
+
+def run_runtime(
+    cfg: LoudGateConfig,
+    logger: logging.Logger,
+    verbose: bool,
+) -> int:
+    """Run the audio process and its local control endpoint until stopped."""
+
+    stop_event = threading.Event()
+    status = RuntimeStatus()
+    controls_ref: dict[str, AudioControls | None] = {"controls": None}
+
+    def handle_command(command: str, request: dict[str, Any]) -> dict[str, Any]:
+        del request
+        if command in {"status", "ping"}:
+            return {"status": status.snapshot()}
+        if command == "stop":
+            status.update(state="stopping", phase="stop requested")
+            stop_event.set()
+            logger.info("Stop requested by the manager.")
+            return {"status": status.snapshot()}
+        if command == "mute":
+            controls = controls_ref.get("controls")
+            if controls is None:
+                return {"status": status.snapshot(), "warning": "Audio is not running."}
+            controls.muted = not controls.muted
+            status.update(muted=controls.muted)
+            logger.info("Mute set to %s by the manager.", controls.muted)
+            return {"status": status.snapshot()}
+        return {"ok": False, "error": f"Unknown runtime command: {command}"}
+
+    server = RuntimeIpcServer(handle_command)
+    try:
+        server.start()
+        status.update(pid=os.getpid(), state="starting")
+        run_service(
+            cfg,
+            logger,
+            verbose,
+            stop_event=stop_event,
+            status=status,
+            controls_ref=controls_ref,
+        )
+        return 0
+    except Exception as exc:
+        status.update(state="error", phase="runtime process", error=str(exc))
+        logger.exception("Loud Gate runtime stopped unexpectedly: %s", exc)
+        if verbose:
+            print(f"Loud Gate runtime error: {exc}", flush=True)
+        return 1
+    finally:
+        stop_event.set()
+        server.stop()
+        status.update(state="stopped", phase="stopped")
 
 
 def _describe_audio_health(snapshot: AudioHealthSnapshot) -> str:
@@ -576,6 +716,4 @@ def _describe_audio_health(snapshot: AudioHealthSnapshot) -> str:
         details.append(f"callback errors={snapshot.callback_errors}")
     if snapshot.oversized_callbacks:
         details.append(f"oversized callbacks={snapshot.oversized_callbacks}")
-    if snapshot.clipped_input_callbacks:
-        details.append(f"full-scale input callbacks={snapshot.clipped_input_callbacks}")
     return ", ".join(details) if details else "no incidents"
