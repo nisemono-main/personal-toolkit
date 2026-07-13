@@ -8,7 +8,7 @@ A curated collection of small Windows utilities, browser tools, and workflow exp
 | --- | --- | --- |
 | [`nvidia-display-profiles`](./nvidia-display-profiles) | Applies display profiles that switch resolution, refresh rate, brightness, Digital Vibrance, monitor state, and game launch behavior. | PowerShell, Windows APIs, NVIDIA NVAPI |
 | [`chatgpt-userscripts`](./chatgpt-userscripts) | Browser userscripts for ChatGPT queue workflows and crash recovery. | JavaScript, Tampermonkey |
-| [`clipboard-log-cleaner`](./clipboard-log-cleaner) | Compacts verbose clipboard logs into a short message and source location. | PowerShell, VBScript |
+| [`unity-log-compactor`](./unity-log-compactor) | Compacts verbose Unity exception stacks into readable message-and-source summaries. | PowerShell, VBScript |
 | [`microphone-loud-gate`](./microphone-loud-gate) | Routes and limits microphone audio with a lookahead limiter and configurable global hotkeys. | Python, NumPy, sounddevice |
 | [`youtube-ad-skipper`](./youtube-ad-skipper) | Chromium extension that detects YouTube ads, mutes playback, and performs trusted skip clicks. | JavaScript, Manifest V3 |
 | [`streamdeck-launcher`](./streamdeck-launcher) | Configurable launcher for applications, URIs, folders, and companion scripts. | VBScript |
