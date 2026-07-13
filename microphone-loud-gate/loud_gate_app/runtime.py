@@ -8,6 +8,7 @@ import math
 import signal
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 import sounddevice as sd
@@ -92,6 +93,29 @@ HOTKEY_NAMED_KEYS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class HotkeyDefinition:
+    hotkey_id: int
+    config_name: str
+    action_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class HotkeyBinding:
+    definition: HotkeyDefinition
+    modifiers: int
+    virtual_key: int
+    label: str
+
+
+HOTKEY_DEFINITIONS = (
+    HotkeyDefinition(HOTKEY_ID, "mute_hotkey", "mute"),
+    HotkeyDefinition(HOTKEY_ID_STOP, "stop_hotkey", "stop"),
+    HotkeyDefinition(HOTKEY_ID_THRESHOLD_DOWN, "threshold_down_hotkey", "threshold down"),
+    HotkeyDefinition(HOTKEY_ID_THRESHOLD_UP, "threshold_up_hotkey", "threshold up"),
+)
+
+
 def parse_hotkey(value: str, field_name: str) -> tuple[int, int, str]:
     """Parse a human-readable hotkey such as ``Ctrl+Shift+F13``."""
 
@@ -127,19 +151,27 @@ def parse_hotkey(value: str, field_name: str) -> tuple[int, int, str]:
     return modifiers, virtual_key, "+".join(tokens)
 
 
-def configured_hotkeys(cfg: LoudGateConfig) -> dict[int, tuple[int, int, str]]:
-    definitions = (
-        (HOTKEY_ID, "mute_hotkey"),
-        (HOTKEY_ID_STOP, "stop_hotkey"),
-        (HOTKEY_ID_THRESHOLD_DOWN, "threshold_down_hotkey"),
-        (HOTKEY_ID_THRESHOLD_UP, "threshold_up_hotkey"),
-    )
-    bindings = {}
-    for hotkey_id, field_name in definitions:
+def configured_hotkeys(cfg: LoudGateConfig) -> dict[int, HotkeyBinding]:
+    bindings: dict[int, HotkeyBinding] = {}
+    combinations: dict[tuple[int, int], HotkeyBinding] = {}
+    for definition in HOTKEY_DEFINITIONS:
+        field_name = definition.config_name
         try:
-            bindings[hotkey_id] = parse_hotkey(str(getattr(cfg, field_name)), field_name)
+            modifiers, virtual_key, label = parse_hotkey(str(getattr(cfg, field_name)), field_name)
         except (AttributeError, TypeError, ValueError) as exc:
             raise RuntimeError(f"Invalid hotkey configuration: {exc}") from exc
+
+        combination = (modifiers & ~MOD_NOREPEAT, virtual_key)
+        previous = combinations.get(combination)
+        if previous is not None:
+            raise RuntimeError(
+                f"Hotkey configuration conflict: {field_name}={label} is already used by "
+                f"{previous.definition.config_name}={previous.label}."
+            )
+
+        binding = HotkeyBinding(definition, modifiers, virtual_key, label)
+        bindings[definition.hotkey_id] = binding
+        combinations[combination] = binding
 
     return bindings
 
@@ -158,18 +190,14 @@ def install_shutdown_handlers(stop_event: threading.Event) -> None:
 class GlobalHotkeyManager:
     def __init__(
         self,
-        mute_event: threading.Event,
-        stop_event: threading.Event,
         logger: logging.Logger,
-        adjust_threshold: Callable[[float], None],
-        hotkeys: dict[int, tuple[int, int, str]],
+        hotkeys: dict[int, HotkeyBinding],
+        actions: dict[int, Callable[[], None]],
         threshold_step_db: float,
     ):
-        self.mute_event = mute_event
-        self.stop_event = stop_event
         self.logger = logger
-        self.adjust_threshold = adjust_threshold
         self.hotkeys = hotkeys
+        self.actions = actions
         self.threshold_step_db = float(threshold_step_db)
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
@@ -197,6 +225,10 @@ class GlobalHotkeyManager:
         if thread.is_alive():
             self.logger.warning("The global hotkey thread did not stop within two seconds.")
 
+    @property
+    def failure(self) -> BaseException | None:
+        return self._error
+
     def _run(self) -> None:
         try:
             self._thread_id = kernel32.GetCurrentThreadId()
@@ -206,10 +238,15 @@ class GlobalHotkeyManager:
             if self._stop_requested.is_set():
                 return
 
-            for hotkey_id, (modifiers, virtual_key, label) in self.hotkeys.items():
-                if not user32.RegisterHotKey(None, hotkey_id, modifiers, virtual_key):
+            for hotkey_id, binding in self.hotkeys.items():
+                if not user32.RegisterHotKey(
+                    None,
+                    hotkey_id,
+                    binding.modifiers,
+                    binding.virtual_key,
+                ):
                     self._error = RuntimeError(
-                        f"Could not register {label} ({ctypes.WinError()}). "
+                        f"Could not register {binding.label} ({ctypes.WinError()}). "
                         "Choose an unused combination in config.ini."
                     )
                     return
@@ -218,12 +255,13 @@ class GlobalHotkeyManager:
             self._ready.set()
             if self._stop_requested.is_set():
                 return
+            labels = ", ".join(
+                f"{binding.definition.action_name}={binding.label}"
+                for binding in self.hotkeys.values()
+            )
             self.logger.info(
-                "Hotkeys registered: mute=%s, stop=%s, threshold down=%s, threshold up=%s, step=%.1f dB.",
-                self.hotkeys[HOTKEY_ID][2],
-                self.hotkeys[HOTKEY_ID_STOP][2],
-                self.hotkeys[HOTKEY_ID_THRESHOLD_DOWN][2],
-                self.hotkeys[HOTKEY_ID_THRESHOLD_UP][2],
+                "Hotkeys registered: %s, threshold step=%.1f dB.",
+                labels,
                 self.threshold_step_db,
             )
 
@@ -234,21 +272,10 @@ class GlobalHotkeyManager:
                 if result == -1:
                     self._error = ctypes.WinError()
                     break
-                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
-                    if self.mute_event.is_set():
-                        self.mute_event.clear()
-                        self.logger.info("%s: mic unmuted", self.hotkeys[HOTKEY_ID][2])
-                    else:
-                        self.mute_event.set()
-                        self.logger.info("%s: mic muted", self.hotkeys[HOTKEY_ID][2])
-                elif msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID_THRESHOLD_DOWN:
-                    self.adjust_threshold(-self.threshold_step_db)
-                elif msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID_THRESHOLD_UP:
-                    self.adjust_threshold(self.threshold_step_db)
-                elif msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID_STOP:
-                    self.stop_event.set()
-                    self.logger.info("%s: stopping service", self.hotkeys[HOTKEY_ID_STOP][2])
-                    break
+                if msg.message == WM_HOTKEY:
+                    action = self.actions.get(int(msg.wParam))
+                    if action is not None:
+                        action()
         except BaseException as exc:
             self._error = exc
         finally:
@@ -351,13 +378,39 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 direction = "lowered" if delta_db < 0 else "raised"
                 logger.info("Threshold %s by %.1f dB -> %.1f dBFS", direction, step, new_threshold)
 
+            binding_labels = {
+                binding.definition.action_name: binding.label
+                for binding in hotkeys.values()
+            }
+
+            def toggle_mute() -> None:
+                if mute_event.is_set():
+                    mute_event.clear()
+                    logger.info("%s: mic unmuted", binding_labels["mute"])
+                else:
+                    mute_event.set()
+                    logger.info("%s: mic muted", binding_labels["mute"])
+
+            def request_stop() -> None:
+                stop_event.set()
+                logger.info("%s: stopping service", binding_labels["stop"])
+
+            actions_by_name: dict[str, Callable[[], None]] = {
+                "mute": toggle_mute,
+                "stop": request_stop,
+                "threshold down": lambda: adjust_threshold(-threshold_step_db),
+                "threshold up": lambda: adjust_threshold(threshold_step_db),
+            }
+            actions = {
+                binding.definition.hotkey_id: actions_by_name[binding.definition.action_name]
+                for binding in hotkeys.values()
+            }
+
             phase = "buffer and hotkey setup"
             hotkey = GlobalHotkeyManager(
-                mute_event,
-                stop_event,
                 logger,
-                adjust_threshold,
                 hotkeys,
+                actions,
                 threshold_step_db,
             )
             lookahead_output_blocks = max(1, math.ceil(limiter.lookahead_ms / DEFAULT_BLOCK_MS))
@@ -454,6 +507,10 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
 
                     while not stop_event.wait(HEALTH_POLL_SECONDS):
                         phase = "audio health monitoring"
+                        if hotkey.failure is not None:
+                            raise RuntimeError(
+                                "The global hotkey thread stopped unexpectedly."
+                            ) from hotkey.failure
                         audio.rebalance_buffer(
                             high_water_samples=high_water_samples,
                             max_drop_samples=block_size,

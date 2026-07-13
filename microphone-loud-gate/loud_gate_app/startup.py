@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .config import app_dir, ensure_app_dir
+from .config import app_dir, ensure_app_dir, log_path
 
 
 TASK_NAME = "LoudGateMicRouter"
@@ -45,16 +45,44 @@ def startup_launcher_path() -> Path:
     return app_dir() / STARTUP_LAUNCHER_NAME
 
 
+def _vbs_literal(value: str) -> str:
+    """Return a VBScript string literal with embedded quotes escaped."""
+
+    return '"' + value.replace('"', '""') + '"'
+
+
 def write_startup_launcher() -> Path:
+    """Create a hidden launcher that reports a non-zero service exit visibly."""
+
     ensure_app_dir()
     launcher = startup_launcher_path()
     python_exe = str(Path(sys.executable).resolve())
     script = str(entrypoint_path())
+    command = f"{_vbs_literal(python_exe)} {_vbs_literal(script)} --run --quiet"
+    log_file = _vbs_literal(str(log_path()))
     vbs = (
+        "On Error Resume Next\n"
         'Set shell = CreateObject("WScript.Shell")\n'
-        f'shell.Run Chr(34) & "{python_exe}" & Chr(34) & " " & Chr(34) & "{script}" & Chr(34) & " --run --quiet", 0, False\n'
+        f"command = {_vbs_literal(command)}\n"
+        "exitCode = shell.Run(command, 0, True)\n"
+        "errorNumber = Err.Number\n"
+        "errorDescription = Err.Description\n"
+        "On Error GoTo 0\n"
+        "If errorNumber <> 0 Then\n"
+        '    message = "Windows Script Host could not launch Loud Gate." & vbCrLf & _\n'
+        '              "Error: " & errorDescription & vbCrLf & _\n'
+        f'              "See the log for details: " & {log_file}\n'
+        '    MsgBox message, 16, "Loud Gate startup failed"\n'
+        "ElseIf exitCode <> 0 Then\n"
+        '    message = "Loud Gate could not start from Windows startup." & vbCrLf & _\n'
+        '              "Exit code: " & exitCode & vbCrLf & _\n'
+        f'              "See the log for the original error: " & {log_file}\n'
+        '    MsgBox message, 16, "Loud Gate startup failed"\n'
+        "End If\n"
     )
-    launcher.write_text(vbs, encoding="utf-8")
+    temporary = launcher.with_suffix(".tmp")
+    temporary.write_text(vbs, encoding="utf-8", newline="")
+    temporary.replace(launcher)
     return launcher
 
 
@@ -65,7 +93,7 @@ def install_startup_task() -> None:
         raise RuntimeError("SystemRoot is not available; cannot locate Windows Script Host.")
 
     wscript = str(Path(system_root) / "System32" / "wscript.exe")
-    command = subprocess.list2cmdline([wscript, "//B", "//NoLogo", str(launcher)])
+    command = subprocess.list2cmdline([wscript, "//NoLogo", str(launcher)])
     result = subprocess.run(
         [
             "schtasks",

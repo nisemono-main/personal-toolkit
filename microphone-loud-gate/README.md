@@ -12,7 +12,7 @@ py -m venv .venv
 .\.venv\Scripts\python.exe .\loud_gate.py
 ```
 
-The first interactive run discovers likely devices and stores the selected device names and audio settings in `%APPDATA%\loud-gate\config.ini`. The program reads that exact file at startup; `config.example.ini` beside the script is documentation only and is not read automatically. Use `--run` for a non-interactive start, `--setup` to select devices again, and `--install-startup` or `--uninstall-startup` to manage the scheduled task.
+The first interactive run discovers likely devices and stores the selected device names and audio settings in `%APPDATA%\loud-gate\config.ini`. The program reads that exact file at startup; `config.example.ini` beside the script is a repository layout reference only and is not read automatically. Use `--run` for a non-interactive start, `--setup` to select devices again, and `--install-startup` or `--uninstall-startup` to manage the scheduled task.
 
 ## Audio assumptions
 
@@ -29,7 +29,11 @@ physical microphone -> Loud Gate input -> CABLE Input playback endpoint
                               applications use CABLE Output as microphone input
 ```
 
-Edit the `[hotkeys]` section in `%APPDATA%\loud-gate\config.ini` to change the bindings. The default layout is:
+## Configuration and hotkeys
+
+The normal setup path is to create the real configuration by running `loud_gate.py` once and selecting the devices. If you need to create it manually, create `%APPDATA%\loud-gate\config.ini` with the layout documented in `config.example.ini`; do not place it beside the script because that file is never loaded. Changes take effect after restarting Loud Gate.
+
+Edit the `[hotkeys]` section in the real `%APPDATA%\loud-gate\config.ini` to change the bindings. Every configured combination must be unique and available to Windows. The default layout is:
 
 ```ini
 [hotkeys]
@@ -40,7 +44,25 @@ threshold_up_hotkey=Ctrl+F14
 threshold_step_db=5.0
 ```
 
-Supported key names include `F1`–`F24`, letters, digits, and common names such as `Esc`, `Space`, `Enter`, `Home`, `End`, `Left`, `Right`, `Up`, and `Down`. Use `+` between modifiers and the key. Restart Loud Gate after changing the bindings; Windows rejects combinations already registered by another application.
+Supported key names include `F1`–`F24`, letters, digits, and common names such as `Esc`, `Space`, `Enter`, `Home`, `End`, `Left`, `Right`, `Up`, and `Down`. Use `+` between modifiers and the key. Loud Gate rejects duplicate bindings in its own configuration, and Windows rejects combinations already registered by another application.
+
+## Windows startup
+
+After the interactive setup, install the logon task:
+
+```powershell
+.\.venv\Scripts\python.exe .\loud_gate.py --install-startup
+```
+
+The command creates a scheduled task and generates `%APPDATA%\loud-gate\startup_launcher.vbs`. The VBS launcher uses Windows Script Host so the normal background start does not open a command window; it waits for the hidden Python process and shows a visible error window if startup exits unsuccessfully after its bounded retry period. The original failure and startup phase remain in `%APPDATA%\loud-gate\loud_gate.log`.
+
+If the Python executable or repository location changes, run `--install-startup` again to regenerate the launcher with the current paths. If Task Scheduler never launches the task at all, inspect the task's History and Last Run Result because no child process exists to display the popup.
+
+Remove the task with:
+
+```powershell
+.\.venv\Scripts\python.exe .\loud_gate.py --uninstall-startup
+```
 
 Python is used because NumPy and sounddevice provide practical building blocks for real-time audio buffers, device discovery, and the lookahead limiter, while `ctypes` connects the service to Windows global-hotkey APIs. The generated startup launcher uses Windows Script Host so scheduled startup can remain hidden without opening a console window.
 
