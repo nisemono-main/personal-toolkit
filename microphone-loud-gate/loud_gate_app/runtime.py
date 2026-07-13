@@ -7,13 +7,12 @@ import logging
 import math
 import signal
 import threading
-from collections import deque
 from typing import Callable
 
-import numpy as np
 import sounddevice as sd
 from ctypes import wintypes
 
+from .audio_engine import AudioEngine, LookaheadLimiter
 from .config import MAX_THRESHOLD_DB, MIN_THRESHOLD_DB, LoudGateConfig, save_config
 from .devices import (
     hostapi_name,
@@ -150,11 +149,6 @@ def install_shutdown_handlers(stop_event: threading.Event) -> None:
         signal.signal(signal.SIGBREAK, handler)
 
 
-def peak_dbfs(samples: np.ndarray) -> float:
-    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
-    return 20.0 * np.log10(peak + 1e-12)
-
-
 class GlobalHotkeyManager:
     def __init__(
         self,
@@ -243,104 +237,6 @@ class GlobalHotkeyManager:
             self._ready.set()
             for hotkey_id in reversed(self._registered_hotkeys):
                 user32.UnregisterHotKey(None, hotkey_id)
-
-
-class LookaheadLimiter:
-    def __init__(
-        self,
-        threshold_db: float,
-        release_ms: float,
-        lookahead_ms: float,
-        sample_rate: int,
-        block_size: int,
-    ) -> None:
-        self._threshold_lock = threading.Lock()
-        self._threshold_db = float(threshold_db)
-        self.release_ms = float(release_ms)
-        self.lookahead_ms = float(lookahead_ms)
-        self.sample_rate = int(sample_rate)
-        self.block_size = int(block_size)
-        self.block_seconds = self.block_size / float(self.sample_rate)
-        self.segment_size = max(1, int(round(self.sample_rate * 0.001)))
-        self.segment_seconds = self.segment_size / float(self.sample_rate)
-        self.lookahead_segments = max(1, math.ceil(self.lookahead_ms / (self.segment_seconds * 1000.0)))
-
-        if self.release_ms <= 0:
-            self.release_coeff = 0.0
-        else:
-            self.release_coeff = math.exp(-self.segment_seconds / (self.release_ms / 1000.0))
-
-        self.pending_segments: deque[np.ndarray] = deque()
-        self.pending_peaks: deque[float] = deque()
-        self.current_gain_db = 0.0
-
-    def get_threshold_db(self) -> float:
-        with self._threshold_lock:
-            return float(self._threshold_db)
-
-    def set_threshold_db(self, threshold_db: float) -> float:
-        with self._threshold_lock:
-            self._threshold_db = float(threshold_db)
-            return self._threshold_db
-
-    def adjust_threshold_db(self, delta_db: float) -> float:
-        with self._threshold_lock:
-            self._threshold_db = float(self._threshold_db + float(delta_db))
-            return self._threshold_db
-
-    def _target_gain_db(self, peak_db: float) -> float:
-        threshold_db = self.get_threshold_db()
-        if peak_db <= threshold_db:
-            return 0.0
-        return threshold_db - peak_db
-
-    def process(self, in_block: np.ndarray, muted: bool) -> np.ndarray:
-        block = np.asarray(in_block, dtype=np.float32)
-        if block.size == 0:
-            return np.zeros_like(block)
-
-        if muted:
-            self.pending_segments.clear()
-            self.pending_peaks.clear()
-            self.current_gain_db = 0.0
-            return np.zeros_like(block)
-
-        outputs: list[np.ndarray] = []
-        offset = 0
-        total = int(block.shape[0])
-
-        while offset < total:
-            end = min(total, offset + self.segment_size)
-            segment = block[offset:end]
-            offset = end
-
-            self.pending_segments.append(segment.copy())
-            self.pending_peaks.append(peak_dbfs(segment))
-
-            if len(self.pending_segments) <= self.lookahead_segments:
-                outputs.append(np.zeros_like(segment))
-                continue
-
-            window_peak_db = max(self.pending_peaks)
-            target_gain_db = self._target_gain_db(window_peak_db)
-
-            if target_gain_db < self.current_gain_db:
-                self.current_gain_db = target_gain_db
-            else:
-                self.current_gain_db = (
-                    self.release_coeff * self.current_gain_db
-                    + (1.0 - self.release_coeff) * target_gain_db
-                )
-
-            out_segment = self.pending_segments.popleft()
-            self.pending_peaks.popleft()
-
-            gain = 10.0 ** (self.current_gain_db / 20.0)
-            outputs.append((out_segment * gain).astype(np.float32, copy=False))
-
-        if not outputs:
-            return np.zeros_like(block)
-        return np.concatenate(outputs).astype(np.float32, copy=False)
 
 
 def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> None:
@@ -435,8 +331,6 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 hotkeys,
                 threshold_step_db,
             )
-            pending_blocks: deque[np.ndarray] = deque()
-            buffer_lock = threading.Lock()
             lookahead_output_blocks = max(1, math.ceil(limiter.lookahead_ms / DEFAULT_BLOCK_MS))
             max_buffer_blocks = max(16, lookahead_output_blocks * 6 + 4)
             prefill_blocks = max(4, lookahead_output_blocks + 2)
@@ -448,7 +342,12 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 float(devices[out_idx].get("default_high_output_latency") or 0.0),
                 DEFAULT_STREAM_LATENCY_MS / 1000.0,
             )
-            last_pcm = np.zeros(block_size, dtype=np.int16)
+            audio = AudioEngine(
+                limiter=limiter,
+                mute_event=mute_event,
+                output_channels=output_channels,
+                buffer_capacity_samples=max_buffer_blocks * block_size,
+            )
 
             hotkey.start()
             if stop_event.is_set():
@@ -474,59 +373,18 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     flush=True,
                 )
 
-            def input_callback(indata, frames, time_info, status):
-                if status:
-                    # Callback must stay real-time safe; surface device issues through the outer retry loop.
-                    pass
-                incoming = np.asarray(indata[:, 0], dtype=np.float32) / 32768.0
-                processed = limiter.process(incoming, mute_event.is_set())
-                pcm = np.clip(np.rint(processed * 32767.0), -32768, 32767).astype(np.int16)
-                with buffer_lock:
-                    pending_blocks.append(pcm)
-                    while len(pending_blocks) > max_buffer_blocks:
-                        pending_blocks.popleft()
-
-            def output_callback(outdata, frames, time_info, status):
-                nonlocal last_pcm
-                if status:
-                    # Callback must stay real-time safe; surface device issues through the outer retry loop.
-                    pass
-                with buffer_lock:
-                    pcm = pending_blocks.popleft() if pending_blocks else None
-
-                if pcm is None:
-                    pcm = last_pcm
-                else:
-                    last_pcm = pcm
-
-                if pcm.shape[0] != frames:
-                    if pcm.shape[0] > frames:
-                        pcm = pcm[:frames]
-                    else:
-                        padded = np.empty(frames, dtype=np.int16)
-                        padded[: pcm.shape[0]] = pcm
-                        pad_value = int(pcm[-1]) if pcm.size else 0
-                        if pcm.shape[0] < frames:
-                            padded[pcm.shape[0] :] = pad_value
-                        pcm = padded
-
-                last_pcm = pcm.copy()
-                out_block = np.repeat(pcm[:, None], output_channels, axis=1)
-                outdata[:] = out_block
-
             with sd.InputStream(
                 samplerate=sample_rate,
                 blocksize=block_size,
                 dtype="int16",
                 channels=input_channels,
                 device=in_idx,
-                callback=input_callback,
+                callback=audio.input_callback,
                 latency=input_latency,
             ):
                 while not stop_event.is_set():
-                    with buffer_lock:
-                        ready = len(pending_blocks)
-                    if ready >= prefill_blocks:
+                    ready_samples = audio.buffer.available_samples
+                    if ready_samples >= prefill_blocks * block_size:
                         break
                     if stop_event.wait(0.05):
                         break
@@ -537,7 +395,7 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     dtype="int16",
                     channels=output_channels,
                     device=out_idx,
-                    callback=output_callback,
+                    callback=audio.output_callback,
                     latency=output_latency,
                 ):
                     while not stop_event.wait(0.25):
