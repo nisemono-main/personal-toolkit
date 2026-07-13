@@ -20,7 +20,6 @@ class AudioHealthSnapshot:
     output_underflows: int = 0
     buffer_underflow_samples: int = 0
     dropped_samples: int = 0
-    drift_correction_samples: int = 0
 
     @property
     def callback_status_events(self) -> int:
@@ -41,7 +40,6 @@ class AudioHealthSnapshot:
             (
                 self.buffer_underflow_samples,
                 self.dropped_samples,
-                self.drift_correction_samples,
             )
         )
 
@@ -56,7 +54,6 @@ class AudioHealth:
         "output_underflows",
         "buffer_underflow_samples",
         "dropped_samples",
-        "drift_correction_samples",
     )
 
     def __init__(self) -> None:
@@ -86,12 +83,6 @@ class AudioHealth:
             return
         with self._lock:
             self._counters["dropped_samples"] += int(sample_count)
-
-    def report_drift_correction(self, sample_count: int) -> None:
-        if sample_count <= 0:
-            return
-        with self._lock:
-            self._counters["drift_correction_samples"] += int(sample_count)
 
     def consume(self) -> AudioHealthSnapshot:
         with self._lock:
@@ -320,15 +311,70 @@ class AudioEngine:
         mute_event: threading.Event,
         output_channels: int,
         buffer_capacity_samples: int,
+        target_buffer_samples: int | None = None,
+        max_clock_adjustment: float = 0.005,
     ) -> None:
         if output_channels <= 0:
             raise ValueError("output_channels must be greater than zero.")
+        if target_buffer_samples is not None and target_buffer_samples <= 0:
+            raise ValueError("target_buffer_samples must be greater than zero when provided.")
+        if not 0.0 <= max_clock_adjustment < 0.5:
+            raise ValueError("max_clock_adjustment must be between zero and 0.5.")
         self.limiter = limiter
         self.mute_event = mute_event
         self.output_channels = int(output_channels)
         self.buffer = PcmRingBuffer(buffer_capacity_samples)
         self.health = AudioHealth()
+        self._target_buffer_samples = target_buffer_samples
+        self._max_clock_adjustment = float(max_clock_adjustment)
+        self._resampler_capacity = max(8192, self.limiter.block_size * 2)
+        self._resampler_source = np.zeros(self._resampler_capacity, dtype=np.int16)
+        self._resampler_source_float = np.empty(self._resampler_capacity, dtype=np.float32)
+        self._resampler_output_positions = np.arange(
+            self._resampler_capacity,
+            dtype=np.float32,
+        )
+        self._resampler_positions = np.empty(self._resampler_capacity, dtype=np.float32)
+        self._resampler_left_positions = np.empty(self._resampler_capacity, dtype=np.float32)
+        self._resampler_fractions = np.empty(self._resampler_capacity, dtype=np.float32)
+        self._resampler_left_indices = np.empty(self._resampler_capacity, dtype=np.intp)
+        self._resampler_right_indices = np.empty(self._resampler_capacity, dtype=np.intp)
+        self._resampler_left_values = np.empty(self._resampler_capacity, dtype=np.float32)
+        self._resampler_right_values = np.empty(self._resampler_capacity, dtype=np.float32)
+        self._resampler_output = np.empty(self._resampler_capacity, dtype=np.float32)
         self._output_was_muted = False
+
+    def _ensure_resampler_capacity(self, frames: int, source_count: int) -> None:
+        required = max(int(frames), int(source_count))
+        if required <= self._resampler_capacity:
+            return
+
+        self._resampler_capacity = required
+        self._resampler_source = np.zeros(required, dtype=np.int16)
+        self._resampler_source_float = np.empty(required, dtype=np.float32)
+        self._resampler_output_positions = np.arange(required, dtype=np.float32)
+        self._resampler_positions = np.empty(required, dtype=np.float32)
+        self._resampler_left_positions = np.empty(required, dtype=np.float32)
+        self._resampler_fractions = np.empty(required, dtype=np.float32)
+        self._resampler_left_indices = np.empty(required, dtype=np.intp)
+        self._resampler_right_indices = np.empty(required, dtype=np.intp)
+        self._resampler_left_values = np.empty(required, dtype=np.float32)
+        self._resampler_right_values = np.empty(required, dtype=np.float32)
+        self._resampler_output = np.empty(required, dtype=np.float32)
+
+    def _clock_ratio(self, available_samples: int) -> float:
+        if self._target_buffer_samples is None:
+            return 1.0
+
+        relative_error = (
+            float(available_samples - self._target_buffer_samples)
+            / float(self._target_buffer_samples)
+        )
+        correction = max(
+            -self._max_clock_adjustment,
+            min(self._max_clock_adjustment, relative_error * 0.02),
+        )
+        return 1.0 + correction
 
     def input_callback(self, indata, frames, time_info, status) -> None:
         self.health.report_callback_status("input", status)
@@ -357,19 +403,77 @@ class AudioEngine:
             self._output_was_muted = False
 
         mono_output = outdata[:, 0]
-        read_samples = self.buffer.read_into(mono_output)
-        self.health.report_buffer_underflow(mono_output.size - read_samples)
+        frames = int(mono_output.size)
+        if frames <= 0:
+            return
+        ratio = self._clock_ratio(self.buffer.available_samples)
+        source_count = max(2, int(round(frames * ratio)))
+        self._ensure_resampler_capacity(frames, source_count)
+
+        if source_count == frames:
+            read_samples = self.buffer.read_into(mono_output)
+        else:
+            source = self._resampler_source[:source_count]
+            read_samples = self.buffer.read_into(source)
+            source_float = self._resampler_source_float[:source_count]
+            np.copyto(source_float, source, casting="unsafe")
+
+            if frames == 1:
+                self._resampler_output[0] = source_float[0]
+            else:
+                positions = self._resampler_positions[:frames]
+                left_positions = self._resampler_left_positions[:frames]
+                np.multiply(
+                    self._resampler_output_positions[:frames],
+                    (source_count - 1) / float(frames - 1),
+                    out=positions,
+                )
+                np.floor(positions, out=left_positions)
+                self._resampler_left_indices[:frames] = left_positions
+                np.subtract(positions, left_positions, out=self._resampler_fractions[:frames])
+
+                left_indices = self._resampler_left_indices[:frames]
+                right_indices = self._resampler_right_indices[:frames]
+                right_indices[:] = left_indices
+                right_indices += 1
+                np.minimum(right_indices, source_count - 1, out=right_indices)
+                np.take(
+                    source_float,
+                    left_indices,
+                    out=self._resampler_left_values[:frames],
+                )
+                np.take(
+                    source_float,
+                    right_indices,
+                    out=self._resampler_right_values[:frames],
+                )
+                np.subtract(
+                    self._resampler_right_values[:frames],
+                    self._resampler_left_values[:frames],
+                    out=self._resampler_output[:frames],
+                )
+                np.multiply(
+                    self._resampler_output[:frames],
+                    self._resampler_fractions[:frames],
+                    out=self._resampler_output[:frames],
+                )
+                np.add(
+                    self._resampler_left_values[:frames],
+                    self._resampler_output[:frames],
+                    out=self._resampler_output[:frames],
+                )
+
+            np.rint(self._resampler_output[:frames], out=self._resampler_output[:frames])
+            np.clip(
+                self._resampler_output[:frames],
+                -32768,
+                32767,
+                out=self._resampler_output[:frames],
+            )
+            np.copyto(mono_output, self._resampler_output[:frames], casting="unsafe")
+
+        self.health.report_buffer_underflow(
+            max(0, source_count - read_samples)
+        )
         if outdata.shape[1] > 1:
             outdata[:, 1:] = mono_output[:, None]
-
-    def rebalance_buffer(self, high_water_samples: int, max_drop_samples: int) -> int:
-        """Apply a small elastic correction when independent device clocks drift apart."""
-
-        available = self.buffer.available_samples
-        excess = max(0, available - int(high_water_samples))
-        if excess <= 0:
-            return 0
-
-        dropped = self.buffer.discard_oldest(min(excess, int(max_drop_samples)))
-        self.health.report_drift_correction(dropped)
-        return dropped

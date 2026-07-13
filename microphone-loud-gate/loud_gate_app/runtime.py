@@ -436,6 +436,7 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                 mute_event=mute_event,
                 output_channels=output_channels,
                 buffer_capacity_samples=max_buffer_blocks * block_size,
+                target_buffer_samples=prefill_blocks * block_size,
             )
 
             phase = "hotkey registration"
@@ -503,10 +504,6 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                     )
 
                     target_queue_samples = prefill_blocks * block_size
-                    high_water_samples = min(
-                        audio.buffer.capacity_samples,
-                        target_queue_samples + (2 * block_size),
-                    )
                     low_water_samples = max(0, target_queue_samples - (2 * block_size))
                     callback_fault_streak = 0
                     last_health_log = 0.0
@@ -517,10 +514,6 @@ def run_service(cfg: LoudGateConfig, logger: logging.Logger, verbose: bool) -> N
                             raise RuntimeError(
                                 "The global hotkey thread stopped unexpectedly."
                             ) from hotkey.failure
-                        audio.rebalance_buffer(
-                            high_water_samples=high_water_samples,
-                            max_drop_samples=block_size,
-                        )
                         snapshot = audio.health.consume()
                         queue_samples = audio.buffer.available_samples
                         queue_ratio = queue_samples / float(audio.buffer.capacity_samples)
@@ -614,8 +607,6 @@ def _describe_audio_health(snapshot: AudioHealthSnapshot, queue_is_low: bool) ->
         details.append(f"silence-filled samples={snapshot.buffer_underflow_samples}")
     if snapshot.dropped_samples:
         details.append(f"buffer-dropped samples={snapshot.dropped_samples}")
-    if snapshot.drift_correction_samples:
-        details.append(f"clock-drift corrections={snapshot.drift_correction_samples}")
     if queue_is_low:
         details.append("queue below low-water mark")
     return ", ".join(details) if details else "no incidents"
